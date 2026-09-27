@@ -354,7 +354,7 @@ export async function runCodexExec({
           try {
             const summary = telemetry.finish();
             console.log(
-              `Codex telemetry: turns=${summary.turns} input_tokens=${summary.inputTokens} cached_input_tokens=${summary.cachedInputTokens} output_tokens=${summary.outputTokens} tool_calls=${summary.toolCalls} malformed_events=${summary.malformedEvents}`
+              `Codex telemetry: turns=${summary.turns} input_tokens=${summary.inputTokens} cached_input_tokens=${summary.cachedInputTokens} output_tokens=${summary.outputTokens} tool_starts=${summary.toolStarts} malformed_events=${summary.malformedEvents}`
             );
           } catch {
             // Optional diagnostics must never affect the review result.
@@ -456,7 +456,7 @@ type TelemetrySummary = {
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
-  toolCalls: number;
+  toolStarts: number;
   malformedEvents: number;
 };
 
@@ -474,10 +474,11 @@ function createTelemetryCollector() {
     inputTokens: 0,
     cachedInputTokens: 0,
     outputTokens: 0,
-    toolCalls: 0,
+    toolStarts: 0,
     malformedEvents: 0,
   };
   let pending = "";
+  let discardingOversizedLine = false;
 
   const consume = (line: string) => {
     if (line.length === 0) return;
@@ -505,13 +506,15 @@ function createTelemetryCollector() {
           );
           summary.outputTokens += numericField(usage.output_tokens);
         }
-      } else if (event.type === "item.completed") {
+      } else if (event.type === "item.started") {
         const itemType = event.item?.type;
         if (
           typeof itemType === "string" &&
-          (itemType.endsWith("_call") || itemType === "command_execution")
+          (itemType.endsWith("_call") ||
+            itemType === "command_execution" ||
+            itemType === "web_search")
         ) {
-          summary.toolCalls += 1;
+          summary.toolStarts += 1;
         }
       }
     } catch {
@@ -525,7 +528,9 @@ function createTelemetryCollector() {
       let newline = pending.indexOf("\n");
       while (newline !== -1) {
         const line = pending.slice(0, newline);
-        if (Buffer.byteLength(line, "utf8") > MAX_TELEMETRY_LINE_BYTES) {
+        if (discardingOversizedLine) {
+          discardingOversizedLine = false;
+        } else if (Buffer.byteLength(line, "utf8") > MAX_TELEMETRY_LINE_BYTES) {
           summary.malformedEvents += 1;
         } else {
           consume(line);
@@ -535,11 +540,14 @@ function createTelemetryCollector() {
       }
       if (Buffer.byteLength(pending, "utf8") > MAX_TELEMETRY_LINE_BYTES) {
         pending = "";
-        summary.malformedEvents += 1;
+        if (!discardingOversizedLine) summary.malformedEvents += 1;
+        discardingOversizedLine = true;
       }
     },
     finish(): TelemetrySummary {
-      if (pending.length > 0) {
+      if (discardingOversizedLine) {
+        // Counted when the bounded parser first discarded this line.
+      } else if (pending.length > 0) {
         if (Buffer.byteLength(pending, "utf8") > MAX_TELEMETRY_LINE_BYTES) {
           summary.malformedEvents += 1;
         } else {
