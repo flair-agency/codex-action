@@ -354,7 +354,7 @@ export async function runCodexExec({
           try {
             const summary = telemetry.finish();
             console.log(
-              `Codex telemetry: turns=${summary.turns} input_tokens=${summary.inputTokens} cached_input_tokens=${summary.cachedInputTokens} output_tokens=${summary.outputTokens} tool_starts=${summary.toolStarts} malformed_events=${summary.malformedEvents}`
+              `Codex telemetry: turns=${summary.turns} input_tokens=${summary.inputTokens} cached_input_tokens=${summary.cachedInputTokens} cache_write_input_tokens=${summary.turns > 0 && summary.cacheWriteInputTokensAvailable ? summary.cacheWriteInputTokens : "unavailable"} output_tokens=${summary.outputTokens} tool_starts=${summary.toolStarts} malformed_events=${summary.malformedEvents}`
             );
           } catch {
             // Optional diagnostics must never affect the review result.
@@ -455,6 +455,8 @@ type TelemetrySummary = {
   turns: number;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  cacheWriteInputTokensAvailable: boolean;
   outputTokens: number;
   toolStarts: number;
   malformedEvents: number;
@@ -473,6 +475,8 @@ function createTelemetryCollector() {
     turns: 0,
     inputTokens: 0,
     cachedInputTokens: 0,
+    cacheWriteInputTokens: 0,
+    cacheWriteInputTokensAvailable: true,
     outputTokens: 0,
     toolStarts: 0,
     malformedEvents: 0,
@@ -495,7 +499,11 @@ function createTelemetryCollector() {
           | {
               input_tokens?: unknown;
               cached_input_tokens?: unknown;
-              input_tokens_details?: { cached_tokens?: unknown };
+              input_tokens_details?: {
+                cached_tokens?: unknown;
+                cache_write_tokens?: unknown;
+              };
+              cache_write_input_tokens?: unknown;
               output_tokens?: unknown;
             }
           | undefined;
@@ -504,7 +512,21 @@ function createTelemetryCollector() {
           summary.cachedInputTokens += numericField(
             usage.cached_input_tokens ?? usage.input_tokens_details?.cached_tokens
           );
+          const cacheWriteTokens =
+            usage.cache_write_input_tokens ??
+            usage.input_tokens_details?.cache_write_tokens;
+          if (
+            typeof cacheWriteTokens === "number" &&
+            Number.isSafeInteger(cacheWriteTokens) &&
+            cacheWriteTokens >= 0
+          ) {
+            summary.cacheWriteInputTokens += cacheWriteTokens;
+          } else {
+            summary.cacheWriteInputTokensAvailable = false;
+          }
           summary.outputTokens += numericField(usage.output_tokens);
+        } else {
+          summary.cacheWriteInputTokensAvailable = false;
         }
       } else if (event.type === "item.started") {
         const itemType = event.item?.type;

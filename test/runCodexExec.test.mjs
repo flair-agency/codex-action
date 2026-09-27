@@ -27,6 +27,8 @@ function runCodexExecWithFakeCodex({
   safetyStrategy = "unsafe",
   holdStdioOpen = false,
   writeLargeFinalOutput = false,
+  cacheWriteUsage = "top-level",
+  emitCompletedTurn = true,
 } = {}) {
   const tempDir = mkdtempSync(path.join(tmpdir(), "codex-action-permissions-"));
   const capturePath = path.join(tempDir, "args.json");
@@ -51,7 +53,7 @@ if (args.includes("--json")) {
   process.stdout.write(JSON.stringify({ type: "item.started", item: { type: "command_execution", command: "secret-tool-arguments" } }) + "\\n");
   process.stdout.write(JSON.stringify({ type: "item.started", item: { type: "web_search", query: "secret-query" } }) + "\\n");
   process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "web_search", output: "x".repeat(1024 * 1024), secret: "secret-large-output" } }) + "\\n");
-  process.stdout.write(JSON.stringify({ type: "turn.completed", response: { usage: { input_tokens: 123, input_tokens_details: { cached_tokens: 45 }, output_tokens: 67 }, repository_text: "secret-repository-text" } }) + "\\n");
+  if (${emitCompletedTurn}) process.stdout.write(JSON.stringify({ type: "turn.completed", response: { usage: { input_tokens: 123, input_tokens_details: { cached_tokens: 45, ${cacheWriteUsage === "nested" ? "cache_write_tokens: 17, " : ""} }, ${cacheWriteUsage === "top-level" ? "cache_write_input_tokens: 17, " : ""}output_tokens: 67 }, repository_text: "secret-repository-text" } }) + "\\n");
   process.stdout.write("not-json-secret\\n");
 }
 if (process.env.CODEX_HOLD_STDIO_OPEN === "1") {
@@ -180,13 +182,43 @@ test("keeps JSONL telemetry numeric-only and leaves final-message output intact"
   assert.ok(capturedArgs.includes("--json"));
   assert.match(
     result.stdout,
-    /Codex telemetry: turns=1 input_tokens=123 cached_input_tokens=45 output_tokens=67 tool_starts=2 malformed_events=2/
+    /Codex telemetry: turns=1 input_tokens=123 cached_input_tokens=45 cache_write_input_tokens=17 output_tokens=67 tool_starts=2 malformed_events=2/
   );
   assert.doesNotMatch(
     result.stdout,
     /secret-tool-arguments|secret-query|secret-repository-text|secret-large-output|not-json-secret/
   );
   assert.match(result.stdout, /fake final message/);
+});
+
+test("reads nested Responses cache-write telemetry", () => {
+  const { result } = runCodexExecWithFakeCodex({
+    extraArgs: '["--json"]',
+    cacheWriteUsage: "nested",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /cache_write_input_tokens=17/);
+});
+
+test("marks cache-write telemetry unavailable when Codex omits it", () => {
+  const { result } = runCodexExecWithFakeCodex({
+    extraArgs: '["--json"]',
+    cacheWriteUsage: "absent",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /cache_write_input_tokens=unavailable/);
+});
+
+test("marks cache-write telemetry unavailable when no turn completes", () => {
+  const { result } = runCodexExecWithFakeCodex({
+    extraArgs: '["--json"]',
+    emitCompletedTurn: false,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /turns=0 .*cache_write_input_tokens=unavailable/);
 });
 
 test("preserves workspace-write as the default legacy sandbox", () => {
