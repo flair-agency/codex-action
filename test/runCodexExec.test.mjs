@@ -47,6 +47,11 @@ if (process.env.CODEX_WRITE_LARGE_FINAL_OUTPUT === "1") {
   process.stdout.write("stdout-start:" + "o".repeat(1024 * 1024) + ":stdout-end\\n");
   process.stderr.write("stderr-start:" + "e".repeat(1024 * 1024) + ":stderr-end\\n");
 }
+if (args.includes("--json")) {
+  process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "secret-tool-arguments" } }) + "\\n");
+  process.stdout.write(JSON.stringify({ type: "turn.completed", response: { usage: { input_tokens: 123, input_tokens_details: { cached_tokens: 45 }, output_tokens: 67 }, repository_text: "secret-repository-text" } }) + "\\n");
+  process.stdout.write("not-json-secret\\n");
+}
 if (process.env.CODEX_HOLD_STDIO_OPEN === "1") {
   console.log("fake codex stdout");
   console.error("fake codex stderr");
@@ -162,6 +167,18 @@ test("drains large final output without waiting for descendant stdio", () => {
     result.stderr,
     new RegExp(`stderr-start:${"e".repeat(1024 * 1024)}:stderr-end`)
   );
+});
+
+test("keeps JSONL telemetry numeric-only and leaves final-message output intact", () => {
+  const { result, capturedArgs } = runCodexExecWithFakeCodex({
+    extraArgs: '["--json"]',
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(capturedArgs.includes("--json"));
+  assert.match(result.stdout, /Codex telemetry: turns=1 input_tokens=123 cached_input_tokens=45 output_tokens=67 tool_calls=1 malformed_events=1/);
+  assert.doesNotMatch(result.stdout, /secret-tool-arguments|secret-repository-text|not-json-secret/);
+  assert.match(result.stdout, /fake final message/);
 });
 
 test("preserves workspace-write as the default legacy sandbox", () => {

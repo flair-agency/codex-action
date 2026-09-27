@@ -309,13 +309,28 @@ export async function runCodexExec({
       .map((a) => JSON.stringify(a))
       .join(" ")}`
   );
+  // `codex exec --json` emits JSONL events that can contain prompts, tool
+  // arguments, and repository content. When explicitly requested, consume
+  // stdout privately and publish only bounded numeric counters.
+  const collectTelemetry = extraArgs.includes("--json");
+  const telemetry = collectTelemetry ? createTelemetryCollector() : null;
   try {
     await new Promise((resolve, reject) => {
       const child = spawn(program, command, {
         env,
         stdio: ["pipe", "pipe", "pipe"],
       });
-      child.stdout.pipe(process.stdout, { end: false });
+      if (telemetry == null) {
+        child.stdout.pipe(process.stdout, { end: false });
+      } else {
+        child.stdout.on("data", (chunk: Buffer | string) => {
+          try {
+            telemetry.push(chunk.toString());
+          } catch {
+            // Optional diagnostics must never interfere with Codex execution.
+          }
+        });
+      }
       child.stderr.pipe(process.stderr, { end: false });
       child.stdin.write(input);
       child.stdin.end();
@@ -335,6 +350,16 @@ export async function runCodexExec({
       child.once("exit", async (code) => {
         await drainOutputStreams([child.stdout, child.stderr]);
         closeOutputStreams();
+        if (telemetry != null) {
+          try {
+            const summary = telemetry.finish();
+            console.log(
+              `Codex telemetry: turns=${summary.turns} input_tokens=${summary.inputTokens} cached_input_tokens=${summary.cachedInputTokens} output_tokens=${summary.outputTokens} tool_calls=${summary.toolCalls} malformed_events=${summary.malformedEvents}`
+            );
+          } catch {
+            // Optional diagnostics must never affect the review result.
+          }
+        }
         if (code !== 0) {
           reject(new Error(`${program} exited with code ${code}`));
           return;
@@ -424,6 +449,107 @@ async function finalizeExecution(
   } finally {
     await cleanupTempOutput(outputFile, runAsUser);
   }
+}
+
+type TelemetrySummary = {
+  turns: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  toolCalls: number;
+  malformedEvents: number;
+};
+
+const MAX_TELEMETRY_LINE_BYTES = 1024 * 1024;
+
+function numericField(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : 0;
+}
+
+function createTelemetryCollector() {
+  const summary: TelemetrySummary = {
+    turns: 0,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    toolCalls: 0,
+    malformedEvents: 0,
+  };
+  let pending = "";
+
+  const consume = (line: string) => {
+    if (line.length === 0) return;
+    try {
+      const event = JSON.parse(line) as {
+        type?: unknown;
+        item?: { type?: unknown };
+        usage?: unknown;
+        response?: { usage?: unknown };
+      };
+      if (event.type === "turn.completed") {
+        summary.turns += 1;
+        const usage = (event.response?.usage ?? event.usage) as
+          | {
+              input_tokens?: unknown;
+              cached_input_tokens?: unknown;
+              input_tokens_details?: { cached_tokens?: unknown };
+              output_tokens?: unknown;
+            }
+          | undefined;
+        if (usage != null) {
+          summary.inputTokens += numericField(usage.input_tokens);
+          summary.cachedInputTokens += numericField(
+            usage.cached_input_tokens ?? usage.input_tokens_details?.cached_tokens
+          );
+          summary.outputTokens += numericField(usage.output_tokens);
+        }
+      } else if (event.type === "item.completed") {
+        const itemType = event.item?.type;
+        if (
+          typeof itemType === "string" &&
+          (itemType.endsWith("_call") || itemType === "command_execution")
+        ) {
+          summary.toolCalls += 1;
+        }
+      }
+    } catch {
+      summary.malformedEvents += 1;
+    }
+  };
+
+  return {
+    push(chunk: string) {
+      pending += chunk;
+      let newline = pending.indexOf("\n");
+      while (newline !== -1) {
+        const line = pending.slice(0, newline);
+        if (Buffer.byteLength(line, "utf8") > MAX_TELEMETRY_LINE_BYTES) {
+          summary.malformedEvents += 1;
+        } else {
+          consume(line);
+        }
+        pending = pending.slice(newline + 1);
+        newline = pending.indexOf("\n");
+      }
+      if (Buffer.byteLength(pending, "utf8") > MAX_TELEMETRY_LINE_BYTES) {
+        pending = "";
+        summary.malformedEvents += 1;
+      }
+    },
+    finish(): TelemetrySummary {
+      if (pending.length > 0) {
+        if (Buffer.byteLength(pending, "utf8") > MAX_TELEMETRY_LINE_BYTES) {
+          summary.malformedEvents += 1;
+        } else {
+          consume(pending);
+        }
+      }
+      pending = "";
+      return summary;
+    },
+  };
 }
 
 type OutputFile =
