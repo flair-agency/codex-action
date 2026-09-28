@@ -45,7 +45,7 @@ case "$group_entry" in
     ;;
 esac
 
-/usr/bin/env -u NODE_OPTIONS "$node" "$action" drop-sudo --root-phase --user "$user" --group sudo --runner-credentials "$runner_credentials" || exit $?
+/usr/bin/env -u NODE_OPTIONS "$node" "$action" drop-sudo --root-phase --user "$user" --group sudo --runner-credentials "$runner_credentials" 1>&2 || exit $?
 unsafe_nobody_socket="$(/usr/bin/find /run -type s -uid 0 -gid "$nobody_gid" -perm -020 -print -quit)" || {
   echo "Linux drop-sudo could not verify the nobody primary group." >&2
   exit 1
@@ -58,7 +58,7 @@ if /usr/bin/sudo -n -u "$user" -- /usr/bin/sudo -n true 2>/dev/null; then
   echo "Expected sudo to be disabled, but sudo succeeded." >&2
   exit 1
 fi
-echo "Confirmed the standard sudo probe is disabled."
+echo "Confirmed the standard sudo probe is disabled." >&2
 
 set -- /usr/bin/setpriv \
   --reuid="$uid" \
@@ -73,7 +73,7 @@ set -- /usr/bin/setpriv \
   "HOME=$home" "USER=$user" "LOGNAME=$user" "PATH=$runner_path" \
   "NODE_OPTIONS=$node_options" \
   "$@"
-echo "Launching Codex with no_new_privs and empty capability sets."
+echo "Launching Codex with no_new_privs and empty capability sets." >&2
 exec "$@"
 `;
 
