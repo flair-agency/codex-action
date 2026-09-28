@@ -490,13 +490,14 @@ writeFileSync(output, "fake final message\\n");
 
         assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
         assert.match(
-          result.stdout,
+          result.stderr,
           /Confirmed the standard sudo probe is disabled/
         );
         assert.match(
-          result.stdout,
+          result.stderr,
           /Launching Codex with no_new_privs and empty capability sets/
         );
+        assert.doesNotMatch(result.stdout, /drop-sudo|Launching Codex|sudo probe/);
         const capture = JSON.parse(readFileSync(capturePath, "utf8"));
         assert.equal(capture.uid, userId);
         assert.equal(capture.gid, safeGroup);
