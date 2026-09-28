@@ -29,6 +29,8 @@ function runCodexExecWithFakeCodex({
   writeLargeFinalOutput = false,
   cacheWriteUsage = "top-level",
   emitCompletedTurn = true,
+  emitDiagnosticShapes = false,
+  exitCode = 0,
 } = {}) {
   const tempDir = mkdtempSync(path.join(tmpdir(), "codex-action-permissions-"));
   const capturePath = path.join(tempDir, "args.json");
@@ -55,6 +57,12 @@ if (args.includes("--json")) {
   process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "web_search", output: "x".repeat(1024 * 1024), secret: "secret-large-output" } }) + "\\n");
   if (${emitCompletedTurn}) process.stdout.write(JSON.stringify({ type: "turn.completed", response: { usage: { input_tokens: 123, input_tokens_details: { cached_tokens: 45, ${cacheWriteUsage === "nested" ? "cache_write_tokens: 17, " : ""} }, ${cacheWriteUsage === "top-level" ? "cache_write_input_tokens: 17, " : ""}output_tokens: 67 }, repository_text: "secret-repository-text" } }) + "\\n");
   process.stdout.write("not-json-secret\\n");
+  if (${emitDiagnosticShapes}) {
+    process.stdout.write('{"type": secret-structured-value}\\n');
+    process.stdout.write("unquoted-secret-payload\\n");
+    process.stdout.write(String.fromCharCode(27) + "[31mansi-secret-payload" + String.fromCharCode(27) + "[0m\\n");
+    process.stdout.write("null\\n42\\n" + JSON.stringify("secret-json-string") + "\\n[1]\\n" + JSON.stringify({ secret: "secret-object-payload" }) + "\\n");
+  }
 }
 if (process.env.CODEX_HOLD_STDIO_OPEN === "1") {
   console.log("fake codex stdout");
@@ -66,6 +74,7 @@ if (process.env.CODEX_HOLD_STDIO_OPEN === "1") {
   );
   descendant.unref();
 }
+if (process.env.CODEX_EXIT_CODE) process.exitCode = Number(process.env.CODEX_EXIT_CODE);
 `,
     "utf8"
   );
@@ -129,6 +138,7 @@ if (process.env.CODEX_HOLD_STDIO_OPEN === "1") {
         CODEX_CAPTURE_ARGS: capturePath,
         CODEX_HOLD_STDIO_OPEN: holdStdioOpen ? "1" : "0",
         CODEX_WRITE_LARGE_FINAL_OUTPUT: writeLargeFinalOutput ? "1" : "0",
+        CODEX_EXIT_CODE: String(exitCode),
       },
       timeout: holdStdioOpen ? 2_000 : undefined,
       maxBuffer: 10 * 1024 * 1024,
@@ -189,6 +199,24 @@ test("keeps JSONL telemetry numeric-only and leaves final-message output intact"
     /secret-tool-arguments|secret-query|secret-repository-text|secret-large-output|not-json-secret/
   );
   assert.match(result.stdout, /fake final message/);
+});
+
+test("reports safe JSONL parse diagnostics when codex exits unsuccessfully", () => {
+  const { result } = runCodexExecWithFakeCodex({
+    extraArgs: '["--json"]',
+    emitDiagnosticShapes: true,
+    exitCode: 1,
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(
+    result.stderr,
+    /codex exited with code 1 \(JSONL diagnostics: invalid_json_lines=4 unexpected_json_lines=5 unexpected_json_shapes=\{null:1,array:1,string:1,number:1,boolean:0,object:1\} oversized_lines=1 invalid_json_shapes=\{object:1,array:0,string:0,number:0,literal:1,plain_text:2,empty:0\} ansi_escape_lines=1 control_character_lines=1\)/
+  );
+  assert.doesNotMatch(
+    `${result.stdout}\n${result.stderr}`,
+    /secret-tool-arguments|secret-query|secret-repository-text|secret-large-output|not-json-secret|secret-structured-value|unquoted-secret-payload|ansi-secret-payload|secret-json-string|secret-object-payload/
+  );
 });
 
 test("reads nested Responses cache-write telemetry", () => {
