@@ -497,11 +497,16 @@ writeFileSync(output, "fake final message\\n");
           result.stderr,
           /Launching Codex with no_new_privs and empty capability sets/
         );
-        // The Action's "Running:" line describes the script and legitimately
-        // contains setup words. The fake Codex emits no stdout, so any second
-        // line here would be launcher output contaminating Codex JSONL.
-        assert.match(result.stdout, /^Running: /);
-        assert.equal(result.stdout.trimEnd().split(/\r?\n/).length, 1);
+        // The Action describes its command and emits the fake final message.
+        // Any other line would be launcher output contaminating Codex JSONL.
+        const stdoutLines = result.stdout.trimEnd().split(/\r?\n/);
+        assert.equal(stdoutLines.length, 3);
+        assert.match(stdoutLines[0], /^Running: /);
+        assert.equal(stdoutLines[1], "");
+        assert.equal(
+          stdoutLines[2],
+          "::set-output name=final-message::fake final message%0A"
+        );
         const capture = JSON.parse(readFileSync(capturePath, "utf8"));
         assert.equal(capture.uid, userId);
         assert.equal(capture.gid, safeGroup);
