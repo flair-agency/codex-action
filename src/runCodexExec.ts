@@ -366,7 +366,7 @@ export async function runCodexExec({
           const safeDiagnostics =
             telemetrySummary == null
               ? ""
-              : ` (JSONL diagnostics: invalid_json_lines=${telemetrySummary.invalidJsonLines} oversized_lines=${telemetrySummary.oversizedLines})`;
+              : ` (JSONL diagnostics: invalid_json_lines=${telemetrySummary.invalidJsonLines} oversized_lines=${telemetrySummary.oversizedLines} invalid_json_shapes={object:${telemetrySummary.invalidJsonShapes.object},array:${telemetrySummary.invalidJsonShapes.array},string:${telemetrySummary.invalidJsonShapes.string},number:${telemetrySummary.invalidJsonShapes.number},literal:${telemetrySummary.invalidJsonShapes.literal},plain_text:${telemetrySummary.invalidJsonShapes.plainText},empty:${telemetrySummary.invalidJsonShapes.empty}} ansi_escape_lines=${telemetrySummary.invalidJsonAnsiEscapeLines} control_character_lines=${telemetrySummary.invalidJsonControlCharacterLines})`;
           reject(new Error(`${program} exited with code ${code}${safeDiagnostics}`));
           return;
         }
@@ -467,8 +467,20 @@ type TelemetrySummary = {
   toolStarts: number;
   malformedEvents: number;
   invalidJsonLines: number;
+  invalidJsonShapes: Record<InvalidJsonShape, number>;
+  invalidJsonAnsiEscapeLines: number;
+  invalidJsonControlCharacterLines: number;
   oversizedLines: number;
 };
+
+type InvalidJsonShape =
+  | "object"
+  | "array"
+  | "string"
+  | "number"
+  | "literal"
+  | "plainText"
+  | "empty";
 
 const MAX_TELEMETRY_LINE_BYTES = 1024 * 1024;
 
@@ -489,6 +501,17 @@ function createTelemetryCollector() {
     toolStarts: 0,
     malformedEvents: 0,
     invalidJsonLines: 0,
+    invalidJsonShapes: {
+      object: 0,
+      array: 0,
+      string: 0,
+      number: 0,
+      literal: 0,
+      plainText: 0,
+      empty: 0,
+    },
+    invalidJsonAnsiEscapeLines: 0,
+    invalidJsonControlCharacterLines: 0,
     oversizedLines: 0,
   };
   let pending = "";
@@ -552,6 +575,31 @@ function createTelemetryCollector() {
     } catch {
       summary.malformedEvents += 1;
       summary.invalidJsonLines += 1;
+      const trimmed = line.trimStart();
+      const first = trimmed[0];
+      let shape: InvalidJsonShape;
+      if (first === undefined) {
+        shape = "empty";
+      } else if (first === "{") {
+        shape = "object";
+      } else if (first === "[") {
+        shape = "array";
+      } else if (first === '"') {
+        shape = "string";
+      } else if (first === "-" || /[0-9]/.test(first)) {
+        shape = "number";
+      } else if (first === "t" || first === "f" || first === "n") {
+        shape = "literal";
+      } else {
+        shape = "plainText";
+      }
+      summary.invalidJsonShapes[shape] += 1;
+      if (/\u001B\[[0-?]*[ -/]*[@-~]/.test(line)) {
+        summary.invalidJsonAnsiEscapeLines += 1;
+      }
+      if (/[\u0000-\u001F\u007F]/.test(line)) {
+        summary.invalidJsonControlCharacterLines += 1;
+      }
     }
   };
 
