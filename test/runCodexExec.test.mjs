@@ -61,6 +61,7 @@ if (args.includes("--json")) {
     process.stdout.write('{"type": secret-structured-value}\\n');
     process.stdout.write("unquoted-secret-payload\\n");
     process.stdout.write(String.fromCharCode(27) + "[31mansi-secret-payload" + String.fromCharCode(27) + "[0m\\n");
+    process.stdout.write("null\\n42\\n" + JSON.stringify("secret-json-string") + "\\n[1]\\n" + JSON.stringify({ secret: "secret-object-payload" }) + "\\n");
   }
 }
 if (process.env.CODEX_HOLD_STDIO_OPEN === "1") {
@@ -210,11 +211,11 @@ test("reports safe JSONL parse diagnostics when codex exits unsuccessfully", () 
   assert.equal(result.status, 1);
   assert.match(
     result.stderr,
-    /codex exited with code 1 \(JSONL diagnostics: invalid_json_lines=4 oversized_lines=1 invalid_json_shapes=\{object:1,array:0,string:0,number:0,literal:1,plain_text:2,empty:0\} ansi_escape_lines=1 control_character_lines=1\)/
+    /codex exited with code 1 \(JSONL diagnostics: invalid_json_lines=4 unexpected_json_lines=5 unexpected_json_shapes=\{null:1,array:1,string:1,number:1,boolean:0,object:1\} oversized_lines=1 invalid_json_shapes=\{object:1,array:0,string:0,number:0,literal:1,plain_text:2,empty:0\} ansi_escape_lines=1 control_character_lines=1\)/
   );
   assert.doesNotMatch(
     `${result.stdout}\n${result.stderr}`,
-    /secret-tool-arguments|secret-query|secret-repository-text|secret-large-output|not-json-secret|secret-structured-value|unquoted-secret-payload|ansi-secret-payload/
+    /secret-tool-arguments|secret-query|secret-repository-text|secret-large-output|not-json-secret|secret-structured-value|unquoted-secret-payload|ansi-secret-payload|secret-json-string|secret-object-payload/
   );
 });
 

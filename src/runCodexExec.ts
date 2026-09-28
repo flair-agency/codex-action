@@ -366,7 +366,7 @@ export async function runCodexExec({
           const safeDiagnostics =
             telemetrySummary == null
               ? ""
-              : ` (JSONL diagnostics: invalid_json_lines=${telemetrySummary.invalidJsonLines} oversized_lines=${telemetrySummary.oversizedLines} invalid_json_shapes={object:${telemetrySummary.invalidJsonShapes.object},array:${telemetrySummary.invalidJsonShapes.array},string:${telemetrySummary.invalidJsonShapes.string},number:${telemetrySummary.invalidJsonShapes.number},literal:${telemetrySummary.invalidJsonShapes.literal},plain_text:${telemetrySummary.invalidJsonShapes.plainText},empty:${telemetrySummary.invalidJsonShapes.empty}} ansi_escape_lines=${telemetrySummary.invalidJsonAnsiEscapeLines} control_character_lines=${telemetrySummary.invalidJsonControlCharacterLines})`;
+              : ` (JSONL diagnostics: invalid_json_lines=${telemetrySummary.invalidJsonLines} unexpected_json_lines=${telemetrySummary.unexpectedJsonLines} unexpected_json_shapes={null:${telemetrySummary.unexpectedJsonShapes.null},array:${telemetrySummary.unexpectedJsonShapes.array},string:${telemetrySummary.unexpectedJsonShapes.string},number:${telemetrySummary.unexpectedJsonShapes.number},boolean:${telemetrySummary.unexpectedJsonShapes.boolean},object:${telemetrySummary.unexpectedJsonShapes.object}} oversized_lines=${telemetrySummary.oversizedLines} invalid_json_shapes={object:${telemetrySummary.invalidJsonShapes.object},array:${telemetrySummary.invalidJsonShapes.array},string:${telemetrySummary.invalidJsonShapes.string},number:${telemetrySummary.invalidJsonShapes.number},literal:${telemetrySummary.invalidJsonShapes.literal},plain_text:${telemetrySummary.invalidJsonShapes.plainText},empty:${telemetrySummary.invalidJsonShapes.empty}} ansi_escape_lines=${telemetrySummary.invalidJsonAnsiEscapeLines} control_character_lines=${telemetrySummary.invalidJsonControlCharacterLines})`;
           reject(new Error(`${program} exited with code ${code}${safeDiagnostics}`));
           return;
         }
@@ -467,6 +467,8 @@ type TelemetrySummary = {
   toolStarts: number;
   malformedEvents: number;
   invalidJsonLines: number;
+  unexpectedJsonLines: number;
+  unexpectedJsonShapes: Record<UnexpectedJsonShape, number>;
   invalidJsonShapes: Record<InvalidJsonShape, number>;
   invalidJsonAnsiEscapeLines: number;
   invalidJsonControlCharacterLines: number;
@@ -481,6 +483,8 @@ type InvalidJsonShape =
   | "literal"
   | "plainText"
   | "empty";
+
+type UnexpectedJsonShape = "null" | "array" | "string" | "number" | "boolean" | "object";
 
 const MAX_TELEMETRY_LINE_BYTES = 1024 * 1024;
 
@@ -501,6 +505,15 @@ function createTelemetryCollector() {
     toolStarts: 0,
     malformedEvents: 0,
     invalidJsonLines: 0,
+    unexpectedJsonLines: 0,
+    unexpectedJsonShapes: {
+      null: 0,
+      array: 0,
+      string: 0,
+      number: 0,
+      boolean: 0,
+      object: 0,
+    },
     invalidJsonShapes: {
       object: 0,
       array: 0,
@@ -519,13 +532,64 @@ function createTelemetryCollector() {
 
   const consume = (line: string) => {
     if (line.length === 0) return;
+    let parsed: unknown;
     try {
-      const event = JSON.parse(line) as {
-        type?: unknown;
-        item?: { type?: unknown };
-        usage?: unknown;
-        response?: { usage?: unknown };
-      };
+      parsed = JSON.parse(line);
+    } catch {
+      summary.malformedEvents += 1;
+      summary.invalidJsonLines += 1;
+      const trimmed = line.trimStart();
+      const first = trimmed[0];
+      let shape: InvalidJsonShape;
+      if (first === undefined) {
+        shape = "empty";
+      } else if (first === "{") {
+        shape = "object";
+      } else if (first === "[") {
+        shape = "array";
+      } else if (first === '"') {
+        shape = "string";
+      } else if (first === "-" || /[0-9]/.test(first)) {
+        shape = "number";
+      } else if (first === "t" || first === "f" || first === "n") {
+        shape = "literal";
+      } else {
+        shape = "plainText";
+      }
+      summary.invalidJsonShapes[shape] += 1;
+      if (/\u001B\[[0-?]*[ -/]*[@-~]/.test(line)) {
+        summary.invalidJsonAnsiEscapeLines += 1;
+      }
+      if (/[\u0000-\u001F\u007F]/.test(line)) {
+        summary.invalidJsonControlCharacterLines += 1;
+      }
+      return;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      summary.unexpectedJsonLines += 1;
+      let shape: UnexpectedJsonShape;
+      if (parsed === null) {
+        shape = "null";
+      } else if (Array.isArray(parsed)) {
+        shape = "array";
+      } else {
+        shape = typeof parsed as "string" | "number" | "boolean";
+      }
+      summary.unexpectedJsonShapes[shape] += 1;
+      return;
+    }
+    const event = parsed as {
+      type?: unknown;
+      item?: { type?: unknown };
+      usage?: unknown;
+      response?: { usage?: unknown };
+    };
+    if (typeof event.type !== "string") {
+      summary.unexpectedJsonLines += 1;
+      summary.unexpectedJsonShapes.object += 1;
+      return;
+    }
+    try {
       if (event.type === "turn.completed") {
         summary.turns += 1;
         const usage = (event.response?.usage ?? event.usage) as
@@ -573,33 +637,8 @@ function createTelemetryCollector() {
         }
       }
     } catch {
-      summary.malformedEvents += 1;
-      summary.invalidJsonLines += 1;
-      const trimmed = line.trimStart();
-      const first = trimmed[0];
-      let shape: InvalidJsonShape;
-      if (first === undefined) {
-        shape = "empty";
-      } else if (first === "{") {
-        shape = "object";
-      } else if (first === "[") {
-        shape = "array";
-      } else if (first === '"') {
-        shape = "string";
-      } else if (first === "-" || /[0-9]/.test(first)) {
-        shape = "number";
-      } else if (first === "t" || first === "f" || first === "n") {
-        shape = "literal";
-      } else {
-        shape = "plainText";
-      }
-      summary.invalidJsonShapes[shape] += 1;
-      if (/\u001B\[[0-?]*[ -/]*[@-~]/.test(line)) {
-        summary.invalidJsonAnsiEscapeLines += 1;
-      }
-      if (/[\u0000-\u001F\u007F]/.test(line)) {
-        summary.invalidJsonControlCharacterLines += 1;
-      }
+      summary.unexpectedJsonLines += 1;
+      summary.unexpectedJsonShapes.object += 1;
     }
   };
 
