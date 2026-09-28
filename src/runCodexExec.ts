@@ -314,6 +314,7 @@ export async function runCodexExec({
   // stdout privately and publish only bounded numeric counters.
   const collectTelemetry = extraArgs.includes("--json");
   const telemetry = collectTelemetry ? createTelemetryCollector() : null;
+  let telemetrySummary: TelemetrySummary | null = null;
   try {
     await new Promise((resolve, reject) => {
       const child = spawn(program, command, {
@@ -353,6 +354,7 @@ export async function runCodexExec({
         if (telemetry != null) {
           try {
             const summary = telemetry.finish();
+            telemetrySummary = summary;
             console.log(
               `Codex telemetry: turns=${summary.turns} input_tokens=${summary.inputTokens} cached_input_tokens=${summary.cachedInputTokens} cache_write_input_tokens=${summary.turns > 0 && summary.cacheWriteInputTokensAvailable ? summary.cacheWriteInputTokens : "unavailable"} output_tokens=${summary.outputTokens} tool_starts=${summary.toolStarts} malformed_events=${summary.malformedEvents}`
             );
@@ -361,7 +363,11 @@ export async function runCodexExec({
           }
         }
         if (code !== 0) {
-          reject(new Error(`${program} exited with code ${code}`));
+          const safeDiagnostics =
+            telemetrySummary == null
+              ? ""
+              : ` (JSONL diagnostics: invalid_json_lines=${telemetrySummary.invalidJsonLines} oversized_lines=${telemetrySummary.oversizedLines})`;
+          reject(new Error(`${program} exited with code ${code}${safeDiagnostics}`));
           return;
         }
 
@@ -460,6 +466,8 @@ type TelemetrySummary = {
   outputTokens: number;
   toolStarts: number;
   malformedEvents: number;
+  invalidJsonLines: number;
+  oversizedLines: number;
 };
 
 const MAX_TELEMETRY_LINE_BYTES = 1024 * 1024;
@@ -480,6 +488,8 @@ function createTelemetryCollector() {
     outputTokens: 0,
     toolStarts: 0,
     malformedEvents: 0,
+    invalidJsonLines: 0,
+    oversizedLines: 0,
   };
   let pending = "";
   let discardingOversizedLine = false;
@@ -541,6 +551,7 @@ function createTelemetryCollector() {
       }
     } catch {
       summary.malformedEvents += 1;
+      summary.invalidJsonLines += 1;
     }
   };
 
@@ -554,6 +565,7 @@ function createTelemetryCollector() {
           discardingOversizedLine = false;
         } else if (Buffer.byteLength(line, "utf8") > MAX_TELEMETRY_LINE_BYTES) {
           summary.malformedEvents += 1;
+          summary.oversizedLines += 1;
         } else {
           consume(line);
         }
@@ -562,7 +574,10 @@ function createTelemetryCollector() {
       }
       if (Buffer.byteLength(pending, "utf8") > MAX_TELEMETRY_LINE_BYTES) {
         pending = "";
-        if (!discardingOversizedLine) summary.malformedEvents += 1;
+        if (!discardingOversizedLine) {
+          summary.malformedEvents += 1;
+          summary.oversizedLines += 1;
+        }
         discardingOversizedLine = true;
       }
     },
@@ -572,6 +587,7 @@ function createTelemetryCollector() {
       } else if (pending.length > 0) {
         if (Buffer.byteLength(pending, "utf8") > MAX_TELEMETRY_LINE_BYTES) {
           summary.malformedEvents += 1;
+          summary.oversizedLines += 1;
         } else {
           consume(pending);
         }

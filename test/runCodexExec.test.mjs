@@ -29,6 +29,7 @@ function runCodexExecWithFakeCodex({
   writeLargeFinalOutput = false,
   cacheWriteUsage = "top-level",
   emitCompletedTurn = true,
+  exitCode = 0,
 } = {}) {
   const tempDir = mkdtempSync(path.join(tmpdir(), "codex-action-permissions-"));
   const capturePath = path.join(tempDir, "args.json");
@@ -66,6 +67,7 @@ if (process.env.CODEX_HOLD_STDIO_OPEN === "1") {
   );
   descendant.unref();
 }
+if (process.env.CODEX_EXIT_CODE) process.exitCode = Number(process.env.CODEX_EXIT_CODE);
 `,
     "utf8"
   );
@@ -129,6 +131,7 @@ if (process.env.CODEX_HOLD_STDIO_OPEN === "1") {
         CODEX_CAPTURE_ARGS: capturePath,
         CODEX_HOLD_STDIO_OPEN: holdStdioOpen ? "1" : "0",
         CODEX_WRITE_LARGE_FINAL_OUTPUT: writeLargeFinalOutput ? "1" : "0",
+        CODEX_EXIT_CODE: String(exitCode),
       },
       timeout: holdStdioOpen ? 2_000 : undefined,
       maxBuffer: 10 * 1024 * 1024,
@@ -189,6 +192,23 @@ test("keeps JSONL telemetry numeric-only and leaves final-message output intact"
     /secret-tool-arguments|secret-query|secret-repository-text|secret-large-output|not-json-secret/
   );
   assert.match(result.stdout, /fake final message/);
+});
+
+test("reports safe JSONL parse diagnostics when codex exits unsuccessfully", () => {
+  const { result } = runCodexExecWithFakeCodex({
+    extraArgs: '["--json"]',
+    exitCode: 1,
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(
+    result.stderr,
+    /codex exited with code 1 \(JSONL diagnostics: invalid_json_lines=1 oversized_lines=1\)/
+  );
+  assert.doesNotMatch(
+    `${result.stdout}\n${result.stderr}`,
+    /secret-tool-arguments|secret-query|secret-repository-text|secret-large-output|not-json-secret/
+  );
 });
 
 test("reads nested Responses cache-write telemetry", () => {
