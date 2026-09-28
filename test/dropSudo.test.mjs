@@ -497,7 +497,11 @@ writeFileSync(output, "fake final message\\n");
           result.stderr,
           /Launching Codex with no_new_privs and empty capability sets/
         );
-        assert.doesNotMatch(result.stdout, /drop-sudo|Launching Codex|sudo probe/);
+        // The Action's "Running:" line describes the script and legitimately
+        // contains setup words. The fake Codex emits no stdout, so any second
+        // line here would be launcher output contaminating Codex JSONL.
+        assert.match(result.stdout, /^Running: /);
+        assert.equal(result.stdout.trimEnd().split(/\r?\n/).length, 1);
         const capture = JSON.parse(readFileSync(capturePath, "utf8"));
         assert.equal(capture.uid, userId);
         assert.equal(capture.gid, safeGroup);
