@@ -498,13 +498,15 @@ writeFileSync(output, "fake final message\\n");
           /Launching Codex with no_new_privs and empty capability sets/
         );
         // The Action describes its command and emits the fake final message.
-        // Any other line would be launcher output contaminating Codex JSONL.
+        // The stale-group scenario also prints one line from its test setup
+        // before the Action starts. Any other line would be launcher output.
         const stdoutLines = result.stdout.trimEnd().split(/\r?\n/);
-        assert.equal(stdoutLines.length, 3);
-        assert.match(stdoutLines[0], /^Running: /);
-        assert.equal(stdoutLines[1], "");
+        const setupLines = scenario.staleGroups ? 1 : 0;
+        assert.equal(stdoutLines.length, setupLines + 3);
+        assert.match(stdoutLines[setupLines], /^Running: /);
+        assert.equal(stdoutLines[setupLines + 1], "");
         assert.equal(
-          stdoutLines[2],
+          stdoutLines[setupLines + 2],
           "::set-output name=final-message::fake final message%0A"
         );
         const capture = JSON.parse(readFileSync(capturePath, "utf8"));
