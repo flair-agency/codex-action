@@ -149,7 +149,10 @@ export function parseWifAccessToken(
     (expiresIn as number) <= 0 ||
     (expiresIn as number) > MAX_WIF_ACCESS_TOKEN_LIFETIME_SECONDS ||
     !Number.isSafeInteger(expiresAt) ||
-    (expiresAt as number) <= nowEpochSeconds
+    (expiresAt as number) <= nowEpochSeconds ||
+    // OpenAI measures expires_in from issuance; time spent exchanging and
+    // delivering the response consumes that lifetime.
+    (expiresAt as number) - nowEpochSeconds > (expiresIn as number)
   ) {
     throw new Error("Invalid or expired WIF token exchange response");
   }

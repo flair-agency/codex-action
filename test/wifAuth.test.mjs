@@ -182,6 +182,8 @@ test("rejects expired or malformed exchange responses", () => {
     successfulResponse({ expires_at: now - 1 }),
     successfulResponse({ expires_in: 0 }),
     successfulResponse({ expires_in: 1.5 }),
+    successfulResponse({ expires_in: 1, expires_at: now + 3600 }),
+    successfulResponse({ expires_in: 1, expires_at: now + 3601 }),
     successfulResponse({ expires_in: 3601 }),
     successfulResponse({ token_type: "MAC" }),
     successfulResponse({ access_token: " " }),
@@ -193,6 +195,20 @@ test("rejects expired or malformed exchange responses", () => {
   for (const badResponse of badResponses) {
     assert.throws(() => parseWifAccessToken(badResponse, now));
   }
+});
+
+test("accepts an absolute expiry shortened by exchange delivery time", () => {
+  assert.deepEqual(
+    parseWifAccessToken(
+      successfulResponse({ expires_in: 3600, expires_at: now + 3599 }),
+      now
+    ),
+    {
+      accessToken: exchangedToken,
+      expiresIn: 3600,
+      expiresAt: now + 3599,
+    }
+  );
 });
 
 test("rejects an invalid injected clock without making a transport call", async () => {
