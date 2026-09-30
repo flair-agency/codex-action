@@ -99,7 +99,7 @@ jobs:
           # This final step removes sudo only on the disposable hosted runner.
           # Findings are visibility observations, not an acceptance decision.
 
-          exec node "$GITHUB_WORKSPACE/dist/main.js" run-codex-exec \
+          node "$GITHUB_WORKSPACE/dist/main.js" run-codex-exec \
             --prompt 'synthetic local sandbox probe; do not call a model' \
             --prompt-file '' \
             --codex-home "$PROBE_CODEX_HOME" \
@@ -115,3 +115,5 @@ jobs:
             --safety-strategy 'drop-sudo' \
             --codex-user '' \
             --timeout-seconds 45
+
+          test "$(cat "$RUNNER_TEMP/wif-probe-output.md")" = "Synthetic Linux isolation probe completed."

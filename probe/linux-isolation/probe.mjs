@@ -120,7 +120,7 @@ const child = spawnSync(realCodex, [
   process.env.GITHUB_WORKSPACE + '/probe/linux-isolation/probe.mjs',
   'tool',
   JSON.stringify(targets),
-], { env: process.env, stdio: 'inherit', timeout: 20_000 });
+], { env: process.env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000 });
 if (child.error) {
   process.stderr.write(`Codex sandbox command failed to start (${child.error.code ?? 'unknown'}).\n`);
   process.exit(1);
@@ -129,6 +129,18 @@ if (child.signal || child.status !== 0) {
   process.stderr.write(`Codex sandbox command failed (status=${child.status ?? 'none'}, signal=${child.signal ?? 'none'}).\n`);
   process.exit(child.status ?? 1);
 }
+
+const sandboxLine = child.stdout.split('\n').find(line => line.startsWith('WIF_ISOLATION_PROBE '));
+if (!sandboxLine) {
+  process.stderr.write('Real sandbox returned no probe record; observations incomplete.\n');
+  process.exit(1);
+}
+const sandboxFacts = JSON.parse(sandboxLine.slice('WIF_ISOLATION_PROBE '.length));
+if (sandboxFacts.label !== 'codex-sandbox-command') {
+  process.stderr.write('Unexpected sandbox record.\n');
+  process.exit(1);
+}
+process.stdout.write(`WIF_ISOLATION_PROBE ${JSON.stringify(sandboxFacts)}\n`);
 
 if (!existsSync(`/proc/${targets.rootPid}`)) {
   process.stderr.write('Root holder ended during probe; process findings incomplete.\n');
