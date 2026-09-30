@@ -52,6 +52,9 @@ jobs:
           PROBE_ROOT_FILE: ${{ runner.temp }}/wif-root-owned-canary
           PROBE_ROOT_PID_FILE: ${{ runner.temp }}/wif-root-process.pid
           PROBE_ROOT_START_FILE: ${{ runner.temp }}/wif-root-process-starttime
+          PROBE_SAME_UID_HOLDER_PID_FILE: ${{ runner.temp }}/wif-same-uid-holder.pid
+          PROBE_SAME_UID_HOLDER_START_FILE: ${{ runner.temp }}/wif-same-uid-holder-starttime
+          PROBE_SAME_UID_HOLDER_FILE: ${{ runner.temp }}/wif-same-uid-holder-canary
           PROBE_CONTROL_FILE: ${{ runner.temp }}/wif-runner-control
           PROBE_CODEX_HOME: ${{ runner.temp }}/wif-empty-codex-home
           PROBE_BIN_DIR: ${{ runner.temp }}/wif-probe-bin
@@ -75,8 +78,29 @@ jobs:
           sudo install -o root -g root -m 600 /dev/null "$PROBE_ROOT_FILE"
           printf '%s' "$PROBE_ROOT_FILE_CANARY" | sudo tee "$PROBE_ROOT_FILE" >/dev/null
           sudo install -o root -g root -m 600 /dev/null "$PROBE_ROOT_START_FILE"
+          printf '%s' 'synthetic-same-uid-holder-file-canary' > "$PROBE_SAME_UID_HOLDER_FILE"
+          chmod 600 "$PROBE_SAME_UID_HOLDER_FILE"
           printf '%s' 'synthetic-runner-control-file-canary' > "$PROBE_CONTROL_FILE"
           chmod 600 "$PROBE_CONTROL_FILE"
+
+          env -i SYNTHETIC_SAME_UID_AUTH_HOLDER='synthetic-same-uid-auth-holder-canary' \
+            /bin/sh -c 'printf "%s" "$$" > "$1"; exec /bin/sleep 300' \
+            sh "$PROBE_SAME_UID_HOLDER_PID_FILE" >/dev/null 2>&1 &
+          for _ in {1..30}; do
+            [[ -s "$PROBE_SAME_UID_HOLDER_PID_FILE" ]] && break
+            sleep 0.1
+          done
+          test -s "$PROBE_SAME_UID_HOLDER_PID_FILE"
+          same_uid_holder_pid="$(cat "$PROBE_SAME_UID_HOLDER_PID_FILE")"
+          "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
+            verify-sameuid "$same_uid_holder_pid" "$PROBE_SAME_UID_HOLDER_FILE" \
+            "$PROBE_SAME_UID_HOLDER_START_FILE" "$PROBE_CONTROL_FILE"
+          same_uid_holder_starttime="$(cat "$PROBE_SAME_UID_HOLDER_START_FILE")"
+          [[ "$same_uid_holder_starttime" =~ ^[0-9]+$ ]]
+          export PROBE_SAME_UID_HOLDER_PID="$same_uid_holder_pid"
+          export PROBE_SAME_UID_HOLDER_STARTTIME="$same_uid_holder_starttime"
+          export PROBE_SAME_UID_EXPECTED_UID="$(id -u)"
+          export PROBE_SAME_UID_PREFLIGHT_VALID=true
 
           sudo env \
             PROBE_ROOT_PROC_CANARY="$PROBE_ROOT_PROC_CANARY" \
@@ -98,10 +122,17 @@ jobs:
           [[ "$root_start_time" =~ ^[0-9]+$ ]]
           export PROBE_ROOT_STARTTIME="$root_start_time"
 
+          cleanup_probe_holders() {
+            if [[ -n "${root_pid:-}" ]]; then sudo kill "$root_pid" >/dev/null 2>&1 || true; fi
+            if [[ -n "${same_uid_holder_pid:-}" ]]; then kill "$same_uid_holder_pid" >/dev/null 2>&1 || true; fi
+          }
+          trap cleanup_probe_holders EXIT
+
           # Validate the shell fixture directly before running it under Codex's sandbox.
           # Its receipt contains only synthetic canary visibility booleans.
           /bin/sh "$GITHUB_WORKSPACE/probe/linux-isolation/observe-shell.sh" \
-            "$$" "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE" direct-shell-control
+            "$$" "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE" direct-shell-control \
+            "$same_uid_holder_pid" "$PROBE_SAME_UID_HOLDER_FILE" "$PROBE_SAME_UID_EXPECTED_UID"
 
           cat > "$PROBE_BIN_DIR/codex" <<'SHIM'
           #!/usr/bin/env bash

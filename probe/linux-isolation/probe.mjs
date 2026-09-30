@@ -12,6 +12,9 @@ const canaries = {
 const rootFileCanary = 'synthetic-root-owned-subject-token-file-canary';
 const rootProcCanary = 'synthetic-root-process-oidc-token-canary';
 const runnerFileCanary = 'synthetic-runner-control-file-canary';
+const sameUidHolderEnvName = 'SYNTHETIC_SAME_UID_AUTH_HOLDER';
+const sameUidHolderCanary = 'synthetic-same-uid-auth-holder-canary';
+const sameUidHolderFileCanary = 'synthetic-same-uid-holder-file-canary';
 const stageMarker = 'WIF_NODE_STAGE_CONTROL_OK';
 
 function parseProcStat(statText, expectedPid) {
@@ -28,6 +31,16 @@ function parseProcStat(statText, expectedPid) {
 function readProcStat(pid) {
   try {
     return parseProcStat(readFileSync(`/proc/${pid}/stat`, 'utf8'), pid);
+  } catch {
+    return null;
+  }
+}
+
+function readProcUids(pid) {
+  try {
+    const line = readFileSync(`/proc/${pid}/status`, 'utf8').split('\n').find(value => value.startsWith('Uid:'));
+    const values = line?.slice(4).trim().split(/\s+/).map(Number);
+    return values?.length === 4 && values.every(Number.isInteger) ? values : null;
   } catch {
     return null;
   }
@@ -93,6 +106,15 @@ function inspect(label, targets) {
     process.env[name] === expected,
   ]));
   const { parentPid, rootPid, rootFile, controlFile } = targets;
+  const sameUid = targets.sameUidHolderPid;
+  const holderUids = readProcUids(sameUid);
+  const effectiveUid = process.geteuid?.() ?? process.getuid?.();
+  let sameUidFileStats;
+  try {
+    sameUidFileStats = statSync(targets.sameUidHolderFile);
+  } catch {
+    sameUidFileStats = null;
+  }
   const facts = {
     label,
     processEnv,
@@ -106,6 +128,14 @@ function inspect(label, targets) {
     rootProcessProcEnv: procContains(rootPid, rootProcCanary),
     rootOwnedFileReadable: fileEquals(rootFile, rootFileCanary),
     runnerControlFileReadable: fileEquals(controlFile, runnerFileCanary),
+    sameUidHolder: {
+      pidVisible: existsSync(`/proc/${sameUid}`),
+      authEnvReadable: procContains(sameUid, `${sameUidHolderEnvName}=${sameUidHolderCanary}`),
+      uidMatchesProcess: Number.isInteger(effectiveUid) && holderUids?.[1] === effectiveUid,
+      fileReadable: fileEquals(targets.sameUidHolderFile, sameUidHolderFileCanary),
+      fileMode0600: sameUidFileStats != null && (sameUidFileStats.mode & 0o777) === 0o600,
+      fileOwnerMatchesProcess: Number.isInteger(effectiveUid) && sameUidFileStats?.uid === effectiveUid,
+    },
   };
   process.stdout.write(`WIF_ISOLATION_PROBE ${JSON.stringify(facts)}\n`);
   return facts;
@@ -135,6 +165,31 @@ if (mode === 'verify-controls') {
   process.exit(valid ? 0 : 1);
 }
 
+if (mode === 'verify-sameuid') {
+  const [holderPid, holderFile, startTimeFile, runnerControlFile] = args;
+  const identity = readProcStat(holderPid);
+  const uids = readProcUids(holderPid);
+  const stats = statSync(holderFile);
+  const effectiveUid = process.geteuid?.() ?? process.getuid?.();
+  const holderUidMatchesRunner = Number.isInteger(effectiveUid) &&
+    uids?.[0] === effectiveUid && uids?.[1] === effectiveUid &&
+    uids?.[2] === effectiveUid && uids?.[3] === effectiveUid;
+  const fileOwnerMatchesRunner = Number.isInteger(effectiveUid) && stats.uid === effectiveUid;
+  const fileMode0600 = (stats.mode & 0o777) === 0o600;
+  const holderFileReadableBefore = fileEquals(holderFile, sameUidHolderFileCanary);
+  const runnerControlReadableBefore = fileEquals(runnerControlFile, runnerFileCanary);
+  const holderCanaryReadableBefore = procContains(holderPid, `${sameUidHolderEnvName}=${sameUidHolderCanary}`);
+  const holderAliveBefore = identity?.alive === true;
+  const valid = holderAliveBefore && holderUidMatchesRunner && fileOwnerMatchesRunner &&
+    fileMode0600 && holderFileReadableBefore && runnerControlReadableBefore && holderCanaryReadableBefore;
+  if (valid) writeFileSync(startTimeFile, `${identity.startTime}\n`, { mode: 0o600 });
+  process.stdout.write(`WIF_SAME_UID_CONTROLS ${JSON.stringify({
+    valid: Boolean(valid), holderAliveBefore, holderUidMatchesRunner, fileOwnerMatchesRunner,
+    fileMode0600, holderFileReadableBefore, runnerControlReadableBefore, holderCanaryReadableBefore,
+  })}\n`);
+  process.exit(valid ? 0 : 1);
+}
+
 if (mode === 'tool') {
   // Paths and PIDs are explicit arguments: environment filtering is measured,
   // and must not erase the observation targets themselves.
@@ -160,8 +215,12 @@ const targets = {
   rootPid: process.env.PROBE_ROOT_PID,
   rootFile: process.env.PROBE_ROOT_FILE,
   controlFile: process.env.PROBE_CONTROL_FILE,
+  sameUidHolderPid: process.env.PROBE_SAME_UID_HOLDER_PID,
+  sameUidHolderFile: process.env.PROBE_SAME_UID_HOLDER_FILE,
 };
-if (process.platform !== 'linux' || Object.values(targets).some(value => !value)) {
+if (process.platform !== 'linux' || Object.values(targets).some(value => !value) ||
+    !process.env.PROBE_SAME_UID_EXPECTED_UID || !process.env.PROBE_SAME_UID_HOLDER_STARTTIME ||
+    process.env.PROBE_SAME_UID_PREFLIGHT_VALID !== 'true') {
   process.stderr.write('Disposable Linux probe targets are required.\n');
   process.exit(2);
 }
@@ -218,7 +277,10 @@ const hasExactKeys = (value, expectedKeys) => value != null &&
 const processEnvKeys = ['oidcRequestUrl', 'oidcRequestToken', 'subjectToken', 'apiKey', 'apiAccessToken'];
 const receiptKeys = [
   'label', 'processEnv', 'wrapperParentProcEnv', 'rootProcessExists',
-  'rootProcessProcEnv', 'rootOwnedFileReadable', 'runnerControlFileReadable',
+  'rootProcessProcEnv', 'rootOwnedFileReadable', 'runnerControlFileReadable', 'sameUidHolder',
+];
+const sameUidHolderKeys = [
+  'pidVisible', 'authEnvReadable', 'uidMatchesProcess', 'fileReadable', 'fileMode0600', 'fileOwnerMatchesProcess',
 ];
 function parseShellReceipt(result, expectedLabel) {
   const line = (result.stdout ?? '').split('\n').find(value => value.startsWith('WIF_SHELL_ISOLATION_PROBE '));
@@ -234,7 +296,8 @@ function parseShellReceipt(result, expectedLabel) {
     typeof facts.rootProcessExists === 'boolean' &&
     typeof facts.rootProcessProcEnv === 'boolean' &&
     typeof facts.rootOwnedFileReadable === 'boolean' &&
-    typeof facts.runnerControlFileReadable === 'boolean';
+    typeof facts.runnerControlFileReadable === 'boolean' &&
+    hasBooleanKeys(facts.sameUidHolder, sameUidHolderKeys);
   if (valid) process.stdout.write(`WIF_SHELL_ISOLATION_PROBE ${JSON.stringify(facts)}\n`);
   return { facts, valid };
 }
@@ -245,6 +308,7 @@ for (const [caseName, childEnv] of [['inherited', process.env], ['scrubbed', scr
   const observation = sandboxStage(`sandbox-shell-observation-${caseName}`, [
     '/bin/sh', shellProbePath,
     targets.parentPid, targets.rootPid, targets.rootFile, targets.controlFile, label,
+    targets.sameUidHolderPid, targets.sameUidHolderFile, process.env.PROBE_SAME_UID_EXPECTED_UID,
   ], 'WIF_SHELL_ISOLATION_PROBE', childEnv);
   const receipt = parseShellReceipt(observation.result, label);
   shellCases.push({ caseName, observation, ...receipt });
@@ -263,6 +327,36 @@ const rootHolderIdentityMatchesAfter = rootHolderAliveAfter &&
   rootIdentityAfter.startTime === process.env.PROBE_ROOT_STARTTIME;
 const runnerControlReadable = receiptsValid && shellCases.every(item => item.facts.runnerControlFileReadable);
 const shellCommandsPassed = shellCases.every(item => item.observation.facts.passed);
+const sameUidIdentityAfter = readProcStat(targets.sameUidHolderPid);
+const sameUidHolderIdentityReadableAfter = sameUidIdentityAfter !== null;
+const sameUidHolderAliveAfter = sameUidHolderIdentityReadableAfter && sameUidIdentityAfter.alive === true;
+const sameUidHolderIdentityMatchesAfter = sameUidHolderAliveAfter &&
+  sameUidIdentityAfter.startTime === process.env.PROBE_SAME_UID_HOLDER_STARTTIME;
+const sameUidUidsAfter = readProcUids(targets.sameUidHolderPid);
+const sameUidHolderUidsReadableAfter = sameUidUidsAfter !== null;
+const sameUidExpectedUid = Number(process.env.PROBE_SAME_UID_EXPECTED_UID);
+const actionEffectiveUid = process.geteuid?.() ?? process.getuid?.();
+const sameUidHolderUidMatchesActionChild = Boolean(Number.isInteger(actionEffectiveUid) &&
+  actionEffectiveUid === sameUidExpectedUid && sameUidUidsAfter?.every(uid => uid === sameUidExpectedUid));
+let sameUidHolderFileStats;
+try {
+  sameUidHolderFileStats = statSync(targets.sameUidHolderFile);
+} catch {
+  sameUidHolderFileStats = null;
+}
+const sameUidHolderFileMode0600After = sameUidHolderFileStats != null &&
+  (sameUidHolderFileStats.mode & 0o777) === 0o600;
+const sameUidHolderFileOwnerMatchesActionChild = sameUidHolderFileStats?.uid === actionEffectiveUid &&
+  sameUidHolderFileStats?.uid === sameUidExpectedUid;
+const sameUidHolderFileReadableByActionChild = fileEquals(targets.sameUidHolderFile, sameUidHolderFileCanary);
+const sameUidHolderAuthEnvReadableByActionChild = procContains(
+  targets.sameUidHolderPid, `${sameUidHolderEnvName}=${sameUidHolderCanary}`,
+);
+const sameUidControlValidBefore = process.env.PROBE_SAME_UID_PREFLIGHT_VALID === 'true';
+const sameUidRunnerControlReadable = receiptsValid && shellCases.every(item => item.facts.runnerControlFileReadable);
+const sameUidHolderObservationComplete = sameUidControlValidBefore && sameUidHolderIdentityMatchesAfter &&
+  sameUidHolderUidMatchesActionChild && sameUidHolderFileMode0600After &&
+  sameUidHolderFileOwnerMatchesActionChild && sameUidRunnerControlReadable;
 const completionReasons = [];
 if (!receiptsValid) completionReasons.push('receipt_invalid');
 if (receiptsValid && !rootPidVisible) completionReasons.push('root_pid_not_visible');
@@ -272,9 +366,16 @@ if (receiptsValid && !runnerControlReadable) completionReasons.push('runner_cont
 if (!inheritedCanariesPresent) completionReasons.push('inherited_canaries_missing');
 if (!scrubbedCanariesAbsent) completionReasons.push('scrubbed_canaries_visible');
 if (!shellCommandsPassed) completionReasons.push('sandbox_command_incomplete');
+if (!sameUidControlValidBefore) completionReasons.push('same_uid_preflight_incomplete');
+if (!sameUidHolderIdentityReadableAfter) completionReasons.push('same_uid_holder_identity_unreadable');
+else if (!sameUidHolderAliveAfter) completionReasons.push('same_uid_holder_ended');
+else if (!sameUidHolderIdentityMatchesAfter) completionReasons.push('same_uid_holder_identity_changed');
+if (!sameUidHolderUidsReadableAfter) completionReasons.push('same_uid_holder_uids_unreadable');
+else if (!sameUidHolderUidMatchesActionChild) completionReasons.push('same_uid_holder_uid_mismatch');
+if (!sameUidHolderFileMode0600After || !sameUidHolderFileOwnerMatchesActionChild) completionReasons.push('same_uid_file_control_changed');
 const controlsComplete = receiptsValid && rootPidVisible && rootHolderAliveAfter &&
   rootHolderIdentityMatchesAfter && runnerControlReadable &&
-  inheritedCanariesPresent && scrubbedCanariesAbsent && shellCommandsPassed;
+  inheritedCanariesPresent && scrubbedCanariesAbsent && shellCommandsPassed && sameUidHolderObservationComplete;
 process.stdout.write(`WIF_SHELL_ISOLATION_COMPLETION ${JSON.stringify({
   structurallyValid: receiptsValid,
   controlsComplete,
@@ -286,6 +387,17 @@ process.stdout.write(`WIF_SHELL_ISOLATION_COMPLETION ${JSON.stringify({
   runnerControlReadable,
   inheritedCommandStatus: inheritedCase.observation.result.status,
   scrubbedCommandStatus: scrubbedCase.observation.result.status,
+  sameUidControlValidBefore,
+  sameUidHolderIdentityReadableAfter,
+  sameUidHolderAliveAfter,
+  sameUidHolderIdentityMatchesAfter,
+  sameUidHolderUidsReadableAfter,
+  sameUidHolderUidMatchesActionChild,
+  sameUidHolderFileMode0600After,
+  sameUidHolderFileOwnerMatchesActionChild,
+  sameUidHolderFileReadableByActionChild,
+  sameUidHolderAuthEnvReadableByActionChild,
+  sameUidHolderObservationComplete,
   reasons: completionReasons,
 })}\n`);
 if (!controlsComplete) {
