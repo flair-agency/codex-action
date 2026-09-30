@@ -74,6 +74,8 @@ if (mode === 'tool') {
     process.stderr.write('Probe controls unavailable; observations are incomplete.\n');
     process.exit(1);
   }
+  // Allow the pipe to drain before exiting this short-lived command.
+  await new Promise(resolve => process.stdout.write('', resolve));
   process.exit(0);
 }
 
@@ -111,6 +113,11 @@ if (!realCodex) {
   process.exit(2);
 }
 
+const version = spawnSync(realCodex, ['--version'], { env: process.env, encoding: 'utf8', timeout: 10_000 });
+const exactVersion = version.status === 0 && version.stdout.trim() === 'codex-cli 0.159.2';
+process.stdout.write(`WIF_ISOLATION_CLI ${JSON.stringify({ exactVersion })}\n`);
+if (!exactVersion) process.exit(1);
+
 const child = spawnSync(realCodex, [
   'sandbox',
   '--permission-profile',
@@ -132,6 +139,7 @@ if (child.signal || child.status !== 0) {
 
 const sandboxLine = child.stdout.split('\n').find(line => line.startsWith('WIF_ISOLATION_PROBE '));
 if (!sandboxLine) {
+  process.stderr.write(`WIF_ISOLATION_CAPTURE ${JSON.stringify({ stdoutPresent: Boolean(child.stdout), stderrPresent: Boolean(child.stderr), stderrMentionsSandbox: /sandbox/i.test(child.stderr), stderrMentionsPermission: /permission|denied/i.test(child.stderr) })}\n`);
   process.stderr.write('Real sandbox returned no probe record; observations incomplete.\n');
   process.exit(1);
 }
