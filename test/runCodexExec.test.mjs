@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -31,6 +31,7 @@ function runCodexExecWithFakeCodex({
   emitCompletedTurn = true,
   emitDiagnosticShapes = false,
   exitCode = 0,
+  timeoutSeconds = 1200,
 } = {}) {
   const tempDir = mkdtempSync(path.join(tmpdir(), "codex-action-permissions-"));
   const capturePath = path.join(tempDir, "args.json");
@@ -125,6 +126,8 @@ if (process.env.CODEX_EXIT_CODE) process.exitCode = Number(process.env.CODEX_EXI
       safetyStrategy,
       "--codex-user",
       "",
+      "--timeout-seconds",
+      String(timeoutSeconds),
     ],
     {
       encoding: "utf8",
@@ -155,6 +158,129 @@ if (process.env.CODEX_EXIT_CODE) process.exitCode = Number(process.env.CODEX_EXI
   return { result, capturedArgs };
 }
 
+function runCancellableCodex({
+  timeoutSeconds = 0,
+  signalAfterLaunch = false,
+  secondSignalAfterLaunch = false,
+} = {}) {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "codex-action-cancel-"));
+  const readyFile = path.join(tempDir, "descendant.ready");
+  const termFile = path.join(tempDir, "descendant.term");
+  const pidFile = path.join(tempDir, "descendant.pid");
+  const heartbeatFile = path.join(tempDir, "descendant.heartbeat");
+  const fakeCodex = path.join(tempDir, "codex.mjs");
+  writeFileSync(
+    fakeCodex,
+    `import { spawn } from "node:child_process";
+spawn(process.execPath, ["-e", 'const fs = require("node:fs"); process.on("SIGTERM", () => fs.writeFileSync(process.env.CODEX_DESCENDANT_TERM, "received")); fs.writeFileSync(process.env.CODEX_DESCENDANT_READY, "ready"); fs.writeFileSync(process.env.CODEX_DESCENDANT_PID, String(process.pid)); setInterval(() => fs.appendFileSync(process.env.CODEX_DESCENDANT_HEARTBEAT, "x"), 50);'], { stdio: "ignore" });
+setInterval(() => {}, 1000);
+`
+  );
+  const launcher = path.join(tempDir, "codex");
+  writeFileSync(launcher, `#!/bin/sh\nexec node "${fakeCodex}" "$@"\n`);
+  chmodSync(launcher, 0o755);
+  const child = spawn(
+    process.execPath,
+    [
+      mainPath,
+      "run-codex-exec",
+      "--prompt",
+      "test",
+      "--prompt-file",
+      "",
+      "--codex-home",
+      "",
+      "--cd",
+      tempDir,
+      "--extra-args",
+      "",
+      "--output-file",
+      path.join(tempDir, "output.txt"),
+      "--output-schema-file",
+      "",
+      "--output-schema",
+      "",
+      "--sandbox",
+      "",
+      "--model",
+      "",
+      "--effort",
+      "",
+      "--safety-strategy",
+      "unsafe",
+      "--codex-user",
+      "",
+      "--timeout-seconds",
+      String(timeoutSeconds),
+    ],
+    {
+      env: {
+        ...process.env,
+        GITHUB_OUTPUT: undefined,
+        PATH: `${tempDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        CODEX_CAPTURE_ARGS: path.join(tempDir, "args.json"),
+        CODEX_DESCENDANT_READY: readyFile,
+        CODEX_DESCENDANT_TERM: termFile,
+        CODEX_DESCENDANT_PID: pidFile,
+        CODEX_DESCENDANT_HEARTBEAT: heartbeatFile,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    }
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  return new Promise((resolve, reject) => {
+    const limit = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("cancellation test timed out"));
+    }, 7000);
+    const poll = setInterval(() => {
+      try {
+        readFileSync(readyFile, "utf8");
+        clearInterval(poll);
+        if (signalAfterLaunch) child.kill("SIGTERM");
+        if (secondSignalAfterLaunch) {
+          setTimeout(() => {
+            child.kill("SIGINT");
+            setTimeout(() => child.kill("SIGTERM"), 150);
+          }, 100);
+        }
+      } catch { /* wait until fake Codex has spawned its descendant */ }
+    }, 20);
+    child.once("close", async (code, signal) => {
+      clearTimeout(limit);
+      clearInterval(poll);
+      const heartbeatAtClose = (() => {
+        try {
+          return readFileSync(heartbeatFile, "utf8").length;
+        } catch {
+          return -1;
+        }
+      })();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const descendantTerminated =
+        heartbeatAtClose >= 0 &&
+        readFileSync(heartbeatFile, "utf8").length === heartbeatAtClose;
+      const descendantReceivedTerm = (() => {
+        try {
+          return readFileSync(termFile, "utf8") === "received";
+        } catch {
+          return false;
+        }
+      })();
+      try {
+        process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
+      } catch {
+        // The descendant was already terminated with its process group.
+      }
+      rmSync(tempDir, { recursive: true, force: true });
+      resolve({ code, signal, stdout, stderr, descendantTerminated, descendantReceivedTerm });
+    });
+  });
+}
+
 test("does not wait for descendants holding stdio open", () => {
   const { result } = runCodexExecWithFakeCodex({ holdStdioOpen: true });
 
@@ -163,6 +289,28 @@ test("does not wait for descendants holding stdio open", () => {
   assert.match(result.stdout, /fake codex stdout/);
   assert.match(result.stderr, /fake codex stderr/);
   assert.match(result.stdout, /fake final message/);
+});
+
+test("deadline terminates the Codex process group without API access", async () => {
+  const result = await runCancellableCodex({ timeoutSeconds: 1 });
+  assert.equal(result.code, 1, JSON.stringify(result));
+  assert.match(result.stderr, /Codex execution cancelled: timeout after 1 seconds/);
+  assert.equal(result.descendantTerminated, true);
+});
+
+test("SIGTERM cancellation terminates descendants and reports a diagnostic", async () => {
+  const result = await runCancellableCodex({ signalAfterLaunch: true });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Codex execution cancelled: SIGTERM/);
+  assert.equal(result.descendantTerminated, true);
+});
+
+test("a second cancellation signal cannot interrupt process-group cleanup", async () => {
+  const result = await runCancellableCodex({ secondSignalAfterLaunch: true });
+  assert.equal(result.code, 1, JSON.stringify(result));
+  assert.match(result.stderr, /Codex execution cancelled: SIGINT/);
+  assert.equal(result.descendantReceivedTerm, true);
+  assert.equal(result.descendantTerminated, true);
 });
 
 test("drains large final output without waiting for descendant stdio", () => {

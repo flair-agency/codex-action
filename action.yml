@@ -108,6 +108,10 @@ inputs:
     description: "If `safety-strategy` is set to `unprivileged-user`, this specifies the UNIX username to run Codex as."
     required: false
     default: ""
+  timeout-seconds:
+    description: "Maximum time for `codex exec` in seconds. The process tree is terminated at the deadline; set to 0 to disable."
+    required: false
+    default: "1200"
   allow-users:
     description: "Comma-separated list of GitHub usernames who can run this action, or '*' to allow all users. Note users who have write access to the GitHub repo have access by default and do not need to be listed here."
     required: false
@@ -361,6 +365,7 @@ runs:
         CODEX_EFFORT: ${{ inputs.effort }}
         CODEX_SAFETY_STRATEGY: ${{ inputs['safety-strategy'] }}
         CODEX_USER: ${{ inputs['codex-user'] }}
+        CODEX_TIMEOUT_SECONDS: ${{ inputs['timeout-seconds'] }}
         ACTION_PATH: ${{ github.action_path }}
         FORCE_COLOR: 1
       shell: bash
@@ -379,4 +384,5 @@ runs:
             --model "$CODEX_MODEL" \
             --effort "$CODEX_EFFORT" \
             --safety-strategy "$CODEX_SAFETY_STRATEGY" \
-            --codex-user "$CODEX_USER"
+            --codex-user "$CODEX_USER" \
+            --timeout-seconds "$CODEX_TIMEOUT_SECONDS"
