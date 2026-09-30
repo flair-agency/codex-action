@@ -27,6 +27,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Test synthetic proc-stat parsing
+        run: node "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" test-proc-stat-parser
+
       - name: Install and identify the pinned public Codex CLI
         shell: bash
         run: |
@@ -48,6 +51,7 @@ jobs:
           SYNTHETIC_OPENAI_API_ACCESS_TOKEN: 'eyJ.synthetic-openai-api-token.signature'
           PROBE_ROOT_FILE: ${{ runner.temp }}/wif-root-owned-canary
           PROBE_ROOT_PID_FILE: ${{ runner.temp }}/wif-root-process.pid
+          PROBE_ROOT_START_FILE: ${{ runner.temp }}/wif-root-process-starttime
           PROBE_CONTROL_FILE: ${{ runner.temp }}/wif-runner-control
           PROBE_CODEX_HOME: ${{ runner.temp }}/wif-empty-codex-home
           PROBE_BIN_DIR: ${{ runner.temp }}/wif-probe-bin
@@ -70,6 +74,7 @@ jobs:
           mkdir -p "$PROBE_CODEX_HOME" "$PROBE_BIN_DIR"
           sudo install -o root -g root -m 600 /dev/null "$PROBE_ROOT_FILE"
           printf '%s' "$PROBE_ROOT_FILE_CANARY" | sudo tee "$PROBE_ROOT_FILE" >/dev/null
+          sudo install -o root -g root -m 600 /dev/null "$PROBE_ROOT_START_FILE"
           printf '%s' 'synthetic-runner-control-file-canary' > "$PROBE_CONTROL_FILE"
           chmod 600 "$PROBE_CONTROL_FILE"
 
@@ -88,7 +93,10 @@ jobs:
           sudo test -r "/proc/$root_pid/environ"
           sudo kill -0 "$root_pid"
           sudo "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
-            verify-controls "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE"
+            verify-controls "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE" "$PROBE_ROOT_START_FILE"
+          root_start_time="$(sudo cat "$PROBE_ROOT_START_FILE")"
+          [[ "$root_start_time" =~ ^[0-9]+$ ]]
+          export PROBE_ROOT_STARTTIME="$root_start_time"
 
           # Validate the shell fixture directly before running it under Codex's sandbox.
           # Its receipt contains only synthetic canary visibility booleans.

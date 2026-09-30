@@ -14,6 +14,29 @@ const rootProcCanary = 'synthetic-root-process-oidc-token-canary';
 const runnerFileCanary = 'synthetic-runner-control-file-canary';
 const stageMarker = 'WIF_NODE_STAGE_CONTROL_OK';
 
+function parseProcStat(statText, expectedPid) {
+  const open = statText.indexOf('(');
+  const close = statText.lastIndexOf(')');
+  if (open < 1 || close <= open || statText.slice(0, open).trim() !== String(expectedPid)) return null;
+  const fields = statText.slice(close + 1).trim().split(/\s+/);
+  const state = fields[0];
+  const startTime = fields[19];
+  if (!/^[A-Za-z]$/.test(state ?? '') || !/^\d+$/.test(startTime ?? '')) return null;
+  return { state, startTime, alive: !['Z', 'X', 'x'].includes(state) };
+}
+
+function readProcStat(pid) {
+  try {
+    return parseProcStat(readFileSync(`/proc/${pid}/stat`, 'utf8'), pid);
+  } catch {
+    return null;
+  }
+}
+
+function statFixture(pid, command, state, startTime) {
+  return `${pid} (${command}) ${[state, ...Array(18).fill('0'), String(startTime)].join(' ')}`;
+}
+
 function resultFacts(stage, result, expectedMarker, nodePathMatchesExecPath) {
   const stdout = result.stdout ?? '';
   const markerPresent = expectedMarker.endsWith('_PROBE')
@@ -89,13 +112,26 @@ function inspect(label, targets) {
 }
 
 const [mode, ...args] = process.argv.slice(2);
+if (mode === 'test-proc-stat-parser') {
+  const normal = parseProcStat(statFixture(321, 'holder with spaces (and parens)', 'S', 98765), 321);
+  const zombie = parseProcStat(statFixture(322, 'holder (zombie)', 'Z', 98766), 322);
+  const dead = parseProcStat(statFixture(323, 'holder (dead)', 'X', 98767), 323);
+  const wrongPid = parseProcStat(statFixture(324, 'holder', 'S', 98768), 325);
+  const valid = normal?.state === 'S' && normal.startTime === '98765' && normal.alive &&
+    zombie?.state === 'Z' && !zombie.alive && dead?.state === 'X' && !dead.alive && wrongPid == null;
+  process.stdout.write(`WIF_PROC_STAT_FIXTURES ${JSON.stringify({ valid })}\n`);
+  process.exit(valid ? 0 : 1);
+}
+
 if (mode === 'verify-controls') {
-  const [rootPid, rootFile, controlFile] = args;
+  const [rootPid, rootFile, controlFile, startTimeFile] = args;
   const stats = statSync(rootFile);
+  const rootIdentity = readProcStat(rootPid);
   const valid = process.getuid?.() === 0 && stats.uid === 0 &&
     (stats.mode & 0o777) === 0o600 && fileEquals(rootFile, rootFileCanary) &&
-    fileEquals(controlFile, runnerFileCanary) && procContains(rootPid, rootProcCanary);
-  process.stdout.write(`WIF_ISOLATION_CONTROLS ${JSON.stringify({ valid })}\n`);
+    fileEquals(controlFile, runnerFileCanary) && procContains(rootPid, rootProcCanary) && Boolean(rootIdentity?.alive);
+  if (valid) writeFileSync(startTimeFile, `${rootIdentity.startTime}\n`, { mode: 0o600 });
+  process.stdout.write(`WIF_ISOLATION_CONTROLS ${JSON.stringify({ valid, rootHolderAliveBefore: rootIdentity?.alive === true })}\n`);
   process.exit(valid ? 0 : 1);
 }
 
@@ -221,18 +257,23 @@ const scrubbedCanariesAbsent = scrubbedCase.valid &&
   Object.values(scrubbedCase.facts.processEnv).every(value => !value);
 const receiptsValid = shellCases.every(item => item.valid);
 const rootPidVisible = receiptsValid && shellCases.every(item => item.facts.rootProcessExists);
-const rootHolderAliveAfter = existsSync(`/proc/${targets.rootPid}`);
+const rootIdentityAfter = readProcStat(targets.rootPid);
+const rootHolderAliveAfter = rootIdentityAfter?.alive === true;
+const rootHolderIdentityMatchesAfter = rootHolderAliveAfter &&
+  rootIdentityAfter.startTime === process.env.PROBE_ROOT_STARTTIME;
 const runnerControlReadable = receiptsValid && shellCases.every(item => item.facts.runnerControlFileReadable);
 const shellCommandsPassed = shellCases.every(item => item.observation.facts.passed);
 const completionReasons = [];
 if (!receiptsValid) completionReasons.push('receipt_invalid');
 if (receiptsValid && !rootPidVisible) completionReasons.push('root_pid_not_visible');
 if (!rootHolderAliveAfter) completionReasons.push('root_holder_ended');
+if (!rootHolderIdentityMatchesAfter) completionReasons.push('root_holder_identity_changed');
 if (receiptsValid && !runnerControlReadable) completionReasons.push('runner_control_unreadable');
 if (!inheritedCanariesPresent) completionReasons.push('inherited_canaries_missing');
 if (!scrubbedCanariesAbsent) completionReasons.push('scrubbed_canaries_visible');
 if (!shellCommandsPassed) completionReasons.push('sandbox_command_incomplete');
-const controlsComplete = receiptsValid && rootPidVisible && rootHolderAliveAfter && runnerControlReadable &&
+const controlsComplete = receiptsValid && rootPidVisible && rootHolderAliveAfter &&
+  rootHolderIdentityMatchesAfter && runnerControlReadable &&
   inheritedCanariesPresent && scrubbedCanariesAbsent && shellCommandsPassed;
 process.stdout.write(`WIF_SHELL_ISOLATION_COMPLETION ${JSON.stringify({
   structurallyValid: receiptsValid,
@@ -241,6 +282,7 @@ process.stdout.write(`WIF_SHELL_ISOLATION_COMPLETION ${JSON.stringify({
   scrubbedCanariesAbsent,
   rootPidVisible,
   rootHolderAliveAfter,
+  rootHolderIdentityMatchesAfter,
   runnerControlReadable,
   inheritedCommandStatus: inheritedCase.observation.result.status,
   scrubbedCommandStatus: scrubbedCase.observation.result.status,
