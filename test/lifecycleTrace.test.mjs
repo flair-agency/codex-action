@@ -1,0 +1,252 @@
+import assert from "node:assert/strict";
+import {
+  chmodSync,
+  mkdirSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+
+const mainPath = fileURLToPath(new URL("../dist/main.js", import.meta.url));
+
+function runFakeCodex(mode, timeoutSeconds, targetPath = null) {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "codex-action-lifecycle-test-"));
+  const runnerTemp = path.join(tempDir, "runner-temp");
+  mkdirSync(runnerTemp);
+  const fakeCodexPath = path.join(tempDir, "fake-codex.mjs");
+  const launcherPath = path.join(tempDir, "codex");
+  const outputPath = path.join(tempDir, "output.txt");
+  const fakeBody = `import { readdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import path from "node:path";
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf("--output-last-message");
+writeFileSync(args[outputIndex + 1], "synthetic final message\\n");
+if (${JSON.stringify(mode)} === "replace-trace") {
+  const traceName = readdirSync(process.env.RUNNER_TEMP).find((name) => name.startsWith("codex-action-lifecycle-"));
+  if (traceName) {
+    const tracePath = path.join(process.env.RUNNER_TEMP, traceName);
+    unlinkSync(tracePath);
+    symlinkSync(process.env.TRACE_TARGET, tracePath);
+  }
+} else if (${JSON.stringify(mode)} === "timeout") {
+  process.on("SIGTERM", () => process.exit(0));
+  setInterval(() => {}, 1000);
+} else if (${JSON.stringify(mode)} === "ignore-term") {
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+}
+`;
+  writeFileSync(fakeCodexPath, fakeBody, "utf8");
+  writeFileSync(
+    launcherPath,
+    `#!/bin/sh\nexec "${process.execPath}" "${fakeCodexPath}" "$@"\n`,
+    "utf8"
+  );
+  chmodSync(launcherPath, 0o755);
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      mainPath,
+      "run-codex-exec",
+      "--prompt",
+      "trace secret prompt",
+      "--prompt-file",
+      "",
+      "--codex-home",
+      "",
+      "--cd",
+      tempDir,
+      "--extra-args",
+      "",
+      "--output-file",
+      outputPath,
+      "--output-schema-file",
+      "",
+      "--output-schema",
+      "",
+      "--sandbox",
+      "",
+      "--model",
+      "trace-secret-model",
+      "--effort",
+      "",
+      "--safety-strategy",
+      "unsafe",
+      "--codex-user",
+      "",
+      "--timeout-seconds",
+      String(timeoutSeconds),
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_OUTPUT: undefined,
+        PATH: `${tempDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        RUNNER_TEMP: runnerTemp,
+        TRACE_TARGET: targetPath ?? undefined,
+        TRACE_SECRET_SENTINEL: "trace-secret-environment",
+      },
+      timeout: 8_000,
+      maxBuffer: 1024 * 1024,
+    }
+  );
+  const traceFiles = readdirSync(runnerTemp);
+  assert.equal(traceFiles.length, 1, `expected one trace file, got ${traceFiles}`);
+  const tracePath = path.join(runnerTemp, traceFiles[0]);
+  const traceText = targetPath == null ? readFileSync(tracePath, "utf8") : "";
+  const trace = traceText.length
+    ? traceText.trim().split("\n").map((line) => JSON.parse(line))
+    : [];
+  const traceReplacement = targetPath == null
+    ? null
+    : {
+        isSymlink: lstatSync(tracePath).isSymbolicLink(),
+        target: readlinkSync(tracePath),
+        contents: readFileSync(targetPath, "utf8"),
+      };
+  rmSync(tempDir, { recursive: true, force: true });
+  return { result, trace, traceText, traceReplacement };
+}
+
+function assertSafeTrace(trace, traceText) {
+  const phases = new Set([
+    "run_started",
+    "pre_spawn_ready",
+    "spawn_requested",
+    "spawned",
+    "spawn_error",
+    "child_error",
+    "deadline_armed",
+    "deadline_fired",
+    "term_attempted",
+    "kill_attempted",
+    "child_exit",
+    "drain_finished",
+    "action_returned",
+  ]);
+  const signals = new Set([
+    null,
+    "SIGABRT",
+    "SIGALRM",
+    "SIGBUS",
+    "SIGCHLD",
+    "SIGCONT",
+    "SIGFPE",
+    "SIGHUP",
+    "SIGILL",
+    "SIGINT",
+    "SIGIO",
+    "SIGKILL",
+    "SIGPIPE",
+    "SIGPROF",
+    "SIGQUIT",
+    "SIGSEGV",
+    "SIGSTOP",
+    "SIGSYS",
+    "SIGTERM",
+    "SIGTRAP",
+    "SIGTSTP",
+    "SIGTTIN",
+    "SIGTTOU",
+    "SIGURG",
+    "SIGUSR1",
+    "SIGUSR2",
+    "SIGVTALRM",
+    "SIGXCPU",
+    "SIGXFSZ",
+    "other",
+  ]);
+  for (const item of trace) {
+    assert.ok(phases.has(item.phase), `unexpected phase ${item.phase}`);
+    assert.ok(Number.isSafeInteger(item.elapsedMs) && item.elapsedMs >= 0);
+    assert.deepEqual(
+      Object.keys(item).sort(),
+      item.phase === "child_exit"
+        ? ["elapsedMs", "exitCode", "phase", "signal"]
+        : ["elapsedMs", "phase"]
+    );
+    if (item.phase === "child_exit") {
+      assert.ok(item.exitCode === null || Number.isSafeInteger(item.exitCode));
+      assert.ok(signals.has(item.signal));
+    }
+  }
+  for (const secret of [
+    "trace secret prompt",
+    "trace-secret-model",
+    "trace-secret-environment",
+    process.cwd(),
+  ]) {
+    assert.equal(traceText.includes(secret), false);
+  }
+}
+
+test("built action records a safe trace for a synthetic quick exit", () => {
+  const { result, trace, traceText } = runFakeCodex("quick", 5);
+  assert.equal(result.status, 0, result.stderr);
+  assertSafeTrace(trace, traceText);
+  const phases = trace.map((item) => item.phase);
+  assert.ok(phases.indexOf("spawn_requested") < phases.indexOf("spawned"));
+  assert.ok(phases.includes("deadline_armed"));
+  assert.equal(phases.includes("deadline_fired"), false);
+  assert.ok(phases.indexOf("child_exit") < phases.indexOf("drain_finished"));
+  assert.equal(phases.at(-1), "action_returned");
+  assert.equal(trace.find((item) => item.phase === "child_exit").exitCode, 0);
+});
+
+test("built action records its deadline and TERM path for a cooperative synthetic child", () => {
+  const { result, trace, traceText } = runFakeCodex("timeout", 1);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Codex execution cancelled: timeout after 1 seconds/);
+  assertSafeTrace(trace, traceText);
+  const phases = trace.map((item) => item.phase);
+  assert.ok(phases.indexOf("deadline_armed") < phases.indexOf("deadline_fired"));
+  assert.ok(phases.indexOf("deadline_fired") < phases.indexOf("term_attempted"));
+  assert.ok(phases.includes("child_exit"));
+  assert.ok(phases.includes("drain_finished"));
+  assert.equal(phases.at(-1), "action_returned");
+});
+
+test("built action records KILL and signal outcome for a synthetic TERM-ignoring child", () => {
+  const { result, trace, traceText } = runFakeCodex("ignore-term", 1);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Codex execution cancelled: timeout after 1 seconds/);
+  assertSafeTrace(trace, traceText);
+  const phases = trace.map((item) => item.phase);
+  assert.ok(phases.indexOf("deadline_fired") < phases.indexOf("term_attempted"));
+  assert.ok(phases.indexOf("term_attempted") < phases.indexOf("kill_attempted"));
+  const childExit = trace.find((item) => item.phase === "child_exit");
+  assert.equal(childExit.exitCode, null);
+  assert.equal(childExit.signal, "SIGKILL");
+  assert.ok(phases.includes("drain_finished"));
+  assert.equal(phases.at(-1), "action_returned");
+});
+
+test("built action keeps trace writes on the opened file after child replaces its path", {
+  skip: process.platform === "win32",
+}, () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "codex-action-trace-target-"));
+  const targetPath = path.join(tempDir, "outside-target.txt");
+  writeFileSync(targetPath, "target-must-remain-unchanged", "utf8");
+
+  const { result, traceReplacement } = runFakeCodex("replace-trace", 5, targetPath);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(traceReplacement, {
+    isSymlink: true,
+    target: targetPath,
+    contents: "target-must-remain-unchanged",
+  });
+  rmSync(tempDir, { recursive: true, force: true });
+});
