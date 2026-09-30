@@ -1,0 +1,117 @@
+name: Linux synthetic WIF isolation probe
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/linux-isolation-probe.yml'
+      - 'probe/linux-isolation/probe.mjs'
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout candidate source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        with:
+          node-version: 22
+
+      - name: Install and identify the pinned public Codex CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global --ignore-scripts @openai/codex@0.159.2
+          codex --version
+          codex sandbox --help
+          real_codex="$(command -v codex)"
+          echo "PROBE_REAL_CODEX=$real_codex" >> "$GITHUB_ENV"
+          echo "PROBE_NODE=$(node -p 'process.execPath')" >> "$GITHUB_ENV"
+
+      - name: Prepare disposable Linux canaries and run action wrapper probe
+        shell: bash
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: 'http://127.0.0.1:9/mock-oidc?audience=synthetic-probe'
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'synthetic-github-oidc-request-token-canary'
+          SYNTHETIC_GITHUB_OIDC_SUBJECT_TOKEN: 'eyJ.synthetic-github-subject-token.signature'
+          OPENAI_API_KEY: 'sk-proj-synthetic-openai-api-key-canary'
+          SYNTHETIC_OPENAI_API_ACCESS_TOKEN: 'eyJ.synthetic-openai-api-token.signature'
+          PROBE_ROOT_FILE: ${{ runner.temp }}/wif-root-owned-canary
+          PROBE_ROOT_PID_FILE: ${{ runner.temp }}/wif-root-process.pid
+          PROBE_CONTROL_FILE: ${{ runner.temp }}/wif-runner-control
+          PROBE_CODEX_HOME: ${{ runner.temp }}/wif-empty-codex-home
+          PROBE_BIN_DIR: ${{ runner.temp }}/wif-probe-bin
+          PROBE_ROOT_FILE_CANARY: 'synthetic-root-owned-subject-token-file-canary'
+          PROBE_ROOT_PROC_CANARY: 'synthetic-root-process-oidc-token-canary'
+        run: |
+          set -euo pipefail
+
+          # Match the action's hosted-Linux user-namespace preparation before
+          # drop-sudo removes the runner's sudo access.
+          current_userns="$(sudo sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [[ -n "$current_userns" && "$current_userns" != 1 ]]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          current_apparmor="$(sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [[ -n "$current_apparmor" && "$current_apparmor" != 0 ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+          mkdir -p "$PROBE_CODEX_HOME" "$PROBE_BIN_DIR"
+          sudo install -o root -g root -m 600 /dev/null "$PROBE_ROOT_FILE"
+          printf '%s' "$PROBE_ROOT_FILE_CANARY" | sudo tee "$PROBE_ROOT_FILE" >/dev/null
+          printf '%s' 'synthetic-runner-control-file-canary' > "$PROBE_CONTROL_FILE"
+          chmod 600 "$PROBE_CONTROL_FILE"
+
+          sudo env \
+            PROBE_ROOT_PROC_CANARY="$PROBE_ROOT_PROC_CANARY" \
+            PROBE_ROOT_PID_FILE="$PROBE_ROOT_PID_FILE" \
+            sh -c 'printf "%s" "$$" > "$PROBE_ROOT_PID_FILE"; exec sleep 300' \
+            >/dev/null 2>&1 &
+          for _ in {1..30}; do
+            [[ -s "$PROBE_ROOT_PID_FILE" ]] && break
+            sleep 0.1
+          done
+          test -s "$PROBE_ROOT_PID_FILE"
+          root_pid="$(cat "$PROBE_ROOT_PID_FILE")"
+          export PROBE_ROOT_PID="$root_pid"
+          sudo test -r "/proc/$root_pid/environ"
+          sudo kill -0 "$root_pid"
+          sudo "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
+            verify-controls "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE"
+
+          cat > "$PROBE_BIN_DIR/codex" <<'SHIM'
+          #!/usr/bin/env bash
+          exec "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" shim "$@"
+          SHIM
+          chmod 700 "$PROBE_BIN_DIR/codex"
+          export PATH="$PROBE_BIN_DIR:$PATH"
+          export PROBE_WRAPPER_PARENT_PID="$$"
+          # This final step removes sudo only on the disposable hosted runner.
+          # Findings are visibility observations, not an acceptance decision.
+
+          exec node "$GITHUB_WORKSPACE/dist/main.js" run-codex-exec \
+            --prompt 'synthetic local sandbox probe; do not call a model' \
+            --prompt-file '' \
+            --codex-home "$PROBE_CODEX_HOME" \
+            --cd "$GITHUB_WORKSPACE" \
+            --extra-args '[]' \
+            --output-file "$RUNNER_TEMP/wif-probe-output.md" \
+            --output-schema-file '' \
+            --output-schema '' \
+            --sandbox 'read-only' \
+            --permission-profile '' \
+            --model '' \
+            --effort '' \
+            --safety-strategy 'drop-sudo' \
+            --codex-user '' \
+            --timeout-seconds 45
