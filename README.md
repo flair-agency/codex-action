@@ -122,6 +122,10 @@ jobs:
 | `allow-bots`             | Allow runs triggered by trusted GitHub bot accounts (`github-actions[bot]`) to bypass the write-access check.                                  | `false`     |
 | `allow-bot-users`        | List of GitHub bot usernames that can bypass the write-access check. `*` is not supported; list trusted bots explicitly.                       | `""`        |
 
+On POSIX, a timeout or cancellation sends `SIGTERM` to the spawned Codex process group,
+then sends `SIGKILL` after a one-second grace period. Descendants that create a separate
+session are outside that process-group bound. On Windows, the action uses `taskkill.exe /T /F`.
+
 ## Permission profiles
 
 Codex permission profiles independently describe filesystem and network access. For workflows that

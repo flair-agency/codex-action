@@ -109,7 +109,7 @@ inputs:
     required: false
     default: ""
   timeout-seconds:
-    description: "Maximum time for `codex exec` in seconds. The process tree is terminated at the deadline; set to 0 to disable."
+    description: "Maximum time for `codex exec` in seconds. On POSIX, its process group receives SIGTERM then SIGKILL after a one-second grace period; Windows uses taskkill /T /F. Set to 0 to disable the deadline."
     required: false
     default: "1200"
   allow-users:
