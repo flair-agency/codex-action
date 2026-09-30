@@ -5,6 +5,7 @@ parent_pid=$1
 root_pid=$2
 root_file=$3
 control_file=$4
+label=$5
 
 proc_has() {
   pid=$1
@@ -29,7 +30,8 @@ if proc_has "$root_pid" 'PROBE_ROOT_PROC_CANARY=synthetic-root-process-oidc-toke
 if [ -r "$root_file" ] && [ "$(cat "$root_file" 2>/dev/null)" = 'synthetic-root-owned-subject-token-file-canary' ]; then root_file_readable=true; else root_file_readable=false; fi
 if [ -r "$control_file" ] && [ "$(cat "$control_file" 2>/dev/null)" = 'synthetic-runner-control-file-canary' ]; then control_file_readable=true; else control_file_readable=false; fi
 
-printf 'WIF_SHELL_ISOLATION_PROBE {"label":"shell-sandbox-command","processEnv":{"oidcRequestUrl":%s,"oidcRequestToken":%s,"subjectToken":%s,"apiKey":%s,"apiAccessToken":%s},"wrapperParentProcEnv":{"oidcRequestToken":%s,"subjectToken":%s,"apiKey":%s,"apiAccessToken":%s},"rootProcessExists":%s,"rootProcessProcEnv":%s,"rootOwnedFileReadable":%s,"runnerControlFileReadable":%s}\n' \
+printf 'WIF_SHELL_ISOLATION_PROBE {"label":"%s","processEnv":{"oidcRequestUrl":%s,"oidcRequestToken":%s,"subjectToken":%s,"apiKey":%s,"apiAccessToken":%s},"wrapperParentProcEnv":{"oidcRequestToken":%s,"subjectToken":%s,"apiKey":%s,"apiAccessToken":%s},"rootProcessExists":%s,"rootProcessProcEnv":%s,"rootOwnedFileReadable":%s,"runnerControlFileReadable":%s}\n' \
+  "$label" \
   "$oidc_url" "$oidc_token" "$subject_token" "$api_key" "$api_access_token" \
   "$parent_oidc_token" "$parent_subject_token" "$parent_api_key" "$parent_api_access_token" \
   "$root_process_exists" "$root_process_env" "$root_file_readable" "$control_file_readable"

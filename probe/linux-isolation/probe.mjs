@@ -174,7 +174,7 @@ process.stdout.write(`WIF_NODE_DIAGNOSTIC ${JSON.stringify({
 const shellProbePath = process.env.GITHUB_WORKSPACE + '/probe/linux-isolation/observe-shell.sh';
 const shellObservation = sandboxStage('sandbox-shell-observation', [
   '/bin/sh', shellProbePath,
-  targets.parentPid, targets.rootPid, targets.rootFile, targets.controlFile,
+  targets.parentPid, targets.rootPid, targets.rootFile, targets.controlFile, 'shell-sandbox-command',
 ], 'WIF_SHELL_ISOLATION_PROBE');
 const child = shellObservation.result;
 const shellLine = (child.stdout ?? '').split('\n').find(line => line.startsWith('WIF_SHELL_ISOLATION_PROBE '));
@@ -187,15 +187,38 @@ try {
 const hasBooleanKeys = (value, expectedKeys) => value != null &&
   JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expectedKeys].sort()) &&
   Object.values(value).every(entry => typeof entry === 'boolean');
-const validShellFacts = shellFacts?.label === 'shell-sandbox-command' &&
+const hasExactKeys = (value, expectedKeys) => value != null &&
+  JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expectedKeys].sort());
+const structurallyValidShellFacts = hasExactKeys(shellFacts, [
+  'label', 'processEnv', 'wrapperParentProcEnv', 'rootProcessExists',
+  'rootProcessProcEnv', 'rootOwnedFileReadable', 'runnerControlFileReadable',
+]) && shellFacts.label === 'shell-sandbox-command' &&
   hasBooleanKeys(shellFacts.processEnv, ['oidcRequestUrl', 'oidcRequestToken', 'subjectToken', 'apiKey', 'apiAccessToken']) &&
   hasBooleanKeys(shellFacts.wrapperParentProcEnv, ['oidcRequestToken', 'subjectToken', 'apiKey', 'apiAccessToken']) &&
-  shellFacts.rootProcessExists === true &&
+  typeof shellFacts.rootProcessExists === 'boolean' &&
   typeof shellFacts.rootProcessProcEnv === 'boolean' &&
   typeof shellFacts.rootOwnedFileReadable === 'boolean' &&
-  shellFacts.runnerControlFileReadable === true;
-if (validShellFacts) process.stdout.write(`WIF_SHELL_ISOLATION_PROBE ${JSON.stringify(shellFacts)}\n`);
-if (!shellObservation.facts.passed || !validShellFacts) {
+  typeof shellFacts.runnerControlFileReadable === 'boolean';
+if (structurallyValidShellFacts) process.stdout.write(`WIF_SHELL_ISOLATION_PROBE ${JSON.stringify(shellFacts)}\n`);
+const rootPidVisible = structurallyValidShellFacts && shellFacts.rootProcessExists === true;
+const runnerControlReadable = structurallyValidShellFacts && shellFacts.runnerControlFileReadable === true;
+const completionReasons = [];
+if (!structurallyValidShellFacts) completionReasons.push('receipt_invalid');
+if (structurallyValidShellFacts && !rootPidVisible) completionReasons.push('root_pid_not_visible');
+if (structurallyValidShellFacts && !runnerControlReadable) completionReasons.push('runner_control_unreadable');
+if (!shellObservation.facts.passed) completionReasons.push('sandbox_command_incomplete');
+const controlsComplete = structurallyValidShellFacts && rootPidVisible && runnerControlReadable;
+process.stdout.write(`WIF_SHELL_ISOLATION_COMPLETION ${JSON.stringify({
+  structurallyValid: structurallyValidShellFacts,
+  controlsComplete,
+  rootPidVisible,
+  runnerControlReadable,
+  commandStatus: child.status,
+  commandSignal: child.signal,
+  commandErrorCode: child.error?.code ?? null,
+  reasons: completionReasons,
+})}\n`);
+if (!shellObservation.facts.passed || !structurallyValidShellFacts || !controlsComplete) {
   process.stderr.write('Sandboxed shell probe receipt incomplete; observations fail closed.\n');
   process.exit(child.status != null && child.status !== 0 ? child.status : 1);
 }

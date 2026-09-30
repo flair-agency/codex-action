@@ -93,7 +93,7 @@ jobs:
           # Validate the shell fixture directly before running it under Codex's sandbox.
           # Its receipt contains only synthetic canary visibility booleans.
           /bin/sh "$GITHUB_WORKSPACE/probe/linux-isolation/observe-shell.sh" \
-            "$$" "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE"
+            "$$" "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE" direct-shell-control
 
           cat > "$PROBE_BIN_DIR/codex" <<'SHIM'
           #!/usr/bin/env bash
