@@ -16,8 +16,8 @@ const stageMarker = 'WIF_NODE_STAGE_CONTROL_OK';
 
 function resultFacts(stage, result, expectedMarker, nodePathMatchesExecPath) {
   const stdout = result.stdout ?? '';
-  const markerPresent = expectedMarker === 'WIF_ISOLATION_PROBE'
-    ? stdout.split('\n').some(line => line.startsWith('WIF_ISOLATION_PROBE '))
+  const markerPresent = expectedMarker.endsWith('_PROBE')
+    ? stdout.split('\n').some(line => line.startsWith(`${expectedMarker} `))
     : stdout.trim() === expectedMarker;
   const facts = {
     stage,
@@ -36,20 +36,6 @@ function resultFacts(stage, result, expectedMarker, nodePathMatchesExecPath) {
   }
   process.stdout.write(`WIF_NODE_STAGE ${JSON.stringify(facts)}\n`);
   return facts;
-}
-
-function targetsFromArgs(args) {
-  return { parentPid: args[0], rootPid: args[1], rootFile: args[2], controlFile: args[3] };
-}
-
-function directToolControl(args) {
-  const nodePath = process.env.PROBE_NODE;
-  const probePath = process.env.GITHUB_WORKSPACE + '/probe/linux-isolation/probe.mjs';
-  const result = spawnSync(nodePath, [probePath, 'tool', JSON.stringify(targetsFromArgs(args))], {
-    env: process.env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000,
-  });
-  const facts = resultFacts('node-direct-tool', result, 'WIF_ISOLATION_PROBE', nodePath === process.execPath);
-  process.exit(facts.passed && facts.nodePathIsAbsolute ? 0 : 1);
 }
 
 function sandboxStage(stage, command, expectedMarker) {
@@ -111,11 +97,6 @@ if (mode === 'verify-controls') {
     fileEquals(controlFile, runnerFileCanary) && procContains(rootPid, rootProcCanary);
   process.stdout.write(`WIF_ISOLATION_CONTROLS ${JSON.stringify({ valid })}\n`);
   process.exit(valid ? 0 : 1);
-}
-
-if (mode === 'fixture-control') {
-  directToolControl(args);
-  process.exit(0);
 }
 
 if (mode === 'tool') {
@@ -183,31 +164,41 @@ if (!shellStage.facts.passed) {
 const inlineStage = sandboxStage('sandbox-node-inline', [
   process.env.PROBE_NODE, '-e', `process.stdout.write(${JSON.stringify(stageMarker + '\n')})`,
 ], stageMarker);
-if (!inlineStage.facts.passed || !inlineStage.facts.nodePathIsAbsolute) {
-  process.stderr.write('Sandbox Node inline marker control failed; actual probe skipped.\n');
-  process.exit(1);
+process.stdout.write(`WIF_NODE_DIAGNOSTIC ${JSON.stringify({
+  stage: 'sandbox-node-inline',
+  passed: inlineStage.facts.passed,
+  nodePathMatchesExecPath: inlineStage.facts.nodePathMatchesExecPath,
+  nodePathIsAbsolute: inlineStage.facts.nodePathIsAbsolute,
+})}\n`);
+
+const shellProbePath = process.env.GITHUB_WORKSPACE + '/probe/linux-isolation/observe-shell.sh';
+const shellObservation = sandboxStage('sandbox-shell-observation', [
+  '/bin/sh', shellProbePath,
+  targets.parentPid, targets.rootPid, targets.rootFile, targets.controlFile,
+], 'WIF_SHELL_ISOLATION_PROBE');
+const child = shellObservation.result;
+const shellLine = (child.stdout ?? '').split('\n').find(line => line.startsWith('WIF_SHELL_ISOLATION_PROBE '));
+let shellFacts;
+try {
+  shellFacts = shellLine ? JSON.parse(shellLine.slice('WIF_SHELL_ISOLATION_PROBE '.length)) : null;
+} catch {
+  shellFacts = null;
 }
-const probePath = process.env.GITHUB_WORKSPACE + '/probe/linux-isolation/probe.mjs';
-const nodeToolStage = sandboxStage('sandbox-node-tool', [
-  process.env.PROBE_NODE, probePath, 'tool', JSON.stringify(targets),
-], 'WIF_ISOLATION_PROBE');
-const child = nodeToolStage.result;
-if (!nodeToolStage.facts.passed || !nodeToolStage.facts.nodePathIsAbsolute) {
-  process.stderr.write('Sandboxed Node probe did not produce a complete receipt; observations incomplete.\n');
+const hasBooleanKeys = (value, expectedKeys) => value != null &&
+  JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expectedKeys].sort()) &&
+  Object.values(value).every(entry => typeof entry === 'boolean');
+const validShellFacts = shellFacts?.label === 'shell-sandbox-command' &&
+  hasBooleanKeys(shellFacts.processEnv, ['oidcRequestUrl', 'oidcRequestToken', 'subjectToken', 'apiKey', 'apiAccessToken']) &&
+  hasBooleanKeys(shellFacts.wrapperParentProcEnv, ['oidcRequestToken', 'subjectToken', 'apiKey', 'apiAccessToken']) &&
+  shellFacts.rootProcessExists === true &&
+  typeof shellFacts.rootProcessProcEnv === 'boolean' &&
+  typeof shellFacts.rootOwnedFileReadable === 'boolean' &&
+  shellFacts.runnerControlFileReadable === true;
+if (validShellFacts) process.stdout.write(`WIF_SHELL_ISOLATION_PROBE ${JSON.stringify(shellFacts)}\n`);
+if (!shellObservation.facts.passed || !validShellFacts) {
+  process.stderr.write('Sandboxed shell probe receipt incomplete; observations fail closed.\n');
   process.exit(child.status != null && child.status !== 0 ? child.status : 1);
 }
-
-const sandboxLine = (child.stdout ?? '').split('\n').find(line => line.startsWith('WIF_ISOLATION_PROBE '));
-if (!sandboxLine) {
-  process.stderr.write('Sandboxed Node probe returned no record; observations incomplete.\n');
-  process.exit(1);
-}
-const sandboxFacts = JSON.parse(sandboxLine.slice('WIF_ISOLATION_PROBE '.length));
-if (sandboxFacts.label !== 'codex-sandbox-command') {
-  process.stderr.write('Unexpected sandbox record; observations incomplete.\n');
-  process.exit(1);
-}
-process.stdout.write(`WIF_ISOLATION_PROBE ${JSON.stringify(sandboxFacts)}\n`);
 
 if (!existsSync(`/proc/${targets.rootPid}`)) {
   process.stderr.write('Root holder ended during probe; process findings incomplete.\n');

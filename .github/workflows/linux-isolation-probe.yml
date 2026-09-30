@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/linux-isolation-probe.yml'
       - 'probe/linux-isolation/probe.mjs'
+      - 'probe/linux-isolation/observe-shell.sh'
 
 permissions:
   contents: read
@@ -89,10 +90,10 @@ jobs:
           sudo "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
             verify-controls "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE"
 
-          # Run the real Node fixture directly before comparing CLI sandbox stages.
+          # Validate the shell fixture directly before running it under Codex's sandbox.
           # Its receipt contains only synthetic canary visibility booleans.
-          "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
-            fixture-control "$$" "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE"
+          /bin/sh "$GITHUB_WORKSPACE/probe/linux-isolation/observe-shell.sh" \
+            "$$" "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE"
 
           cat > "$PROBE_BIN_DIR/codex" <<'SHIM'
           #!/usr/bin/env bash
