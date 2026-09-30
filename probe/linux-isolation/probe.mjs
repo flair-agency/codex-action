@@ -11,6 +11,30 @@ const canaries = {
 const rootFileCanary = 'synthetic-root-owned-subject-token-file-canary';
 const rootProcCanary = 'synthetic-root-process-oidc-token-canary';
 const runnerFileCanary = 'synthetic-runner-control-file-canary';
+const sandboxEchoMarker = 'WIF_SANDBOX_ECHO_CONTROL_OK';
+
+function sandboxEchoControl(stage) {
+  const realCodex = process.env.PROBE_REAL_CODEX;
+  if (!realCodex) {
+    process.stdout.write(`WIF_SANDBOX_ECHO ${JSON.stringify({ stage, errorCode: 'MISSING_CLI_PATH' })}\n`);
+    return false;
+  }
+  const result = spawnSync(realCodex, [
+    'sandbox', '--permission-profile', ':read-only', '--', '/bin/echo', sandboxEchoMarker,
+  ], { env: process.env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 });
+  const facts = {
+    stage,
+    status: result.status,
+    signal: result.signal,
+    errorCode: result.error?.code ?? null,
+    markerPresent: result.stdout?.trim() === sandboxEchoMarker,
+    stdoutBytes: Buffer.byteLength(result.stdout ?? ''),
+    stderrBytes: Buffer.byteLength(result.stderr ?? ''),
+  };
+  process.stdout.write(`WIF_SANDBOX_ECHO ${JSON.stringify(facts)}\n`);
+  return facts.status === 0 && facts.signal == null && facts.errorCode == null &&
+    facts.markerPresent && facts.stderrBytes === 0;
+}
 
 function procContains(pid, value) {
   if (!pid || !value) return false;
@@ -62,6 +86,11 @@ if (mode === 'verify-controls') {
     fileEquals(controlFile, runnerFileCanary) && procContains(rootPid, rootProcCanary);
   process.stdout.write(`WIF_ISOLATION_CONTROLS ${JSON.stringify({ valid })}\n`);
   process.exit(valid ? 0 : 1);
+}
+
+if (mode === 'echo-control') {
+  sandboxEchoControl(args[0] ?? 'direct');
+  process.exit(0);
 }
 
 if (mode === 'tool') {
@@ -117,6 +146,11 @@ const version = spawnSync(realCodex, ['--version'], { env: process.env, encoding
 const exactVersion = version.status === 0 && version.stdout.trim() === 'codex-cli 0.159.2';
 process.stdout.write(`WIF_ISOLATION_CLI ${JSON.stringify({ exactVersion })}\n`);
 if (!exactVersion) process.exit(1);
+
+if (!sandboxEchoControl('action-child')) {
+  process.stderr.write('Sandbox echo control failed; actual probe skipped.\n');
+  process.exit(1);
+}
 
 const child = spawnSync(realCodex, [
   'sandbox',
