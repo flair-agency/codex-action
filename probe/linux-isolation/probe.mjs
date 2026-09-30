@@ -28,6 +28,8 @@ function resultFacts(stage, result, expectedMarker, nodePathMatchesExecPath) {
     stdoutBytes: Buffer.byteLength(stdout),
     stderrBytes: Buffer.byteLength(result.stderr ?? ''),
   };
+  facts.passed = facts.status === 0 && facts.signal == null && facts.errorCode == null &&
+    facts.markerPresent && facts.stderrBytes === 0;
   if (nodePathMatchesExecPath != null) {
     facts.nodePathMatchesExecPath = nodePathMatchesExecPath;
     facts.nodePathIsAbsolute = isAbsolute(process.env.PROBE_NODE ?? '');
@@ -46,7 +48,8 @@ function directToolControl(args) {
   const result = spawnSync(nodePath, [probePath, 'tool', JSON.stringify(targetsFromArgs(args))], {
     env: process.env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000,
   });
-  resultFacts('node-direct-tool', result, 'WIF_ISOLATION_PROBE', nodePath === process.execPath);
+  const facts = resultFacts('node-direct-tool', result, 'WIF_ISOLATION_PROBE', nodePath === process.execPath);
+  process.exit(facts.passed && facts.nodePathIsAbsolute ? 0 : 1);
 }
 
 function sandboxStage(stage, command, expectedMarker) {
@@ -173,17 +176,25 @@ const shellMarker = 'WIF_NODE_STAGE_SHELL_OK';
 const shellStage = sandboxStage('sandbox-shell', [
   '/bin/sh', '-c', 'printf "%s\\n" "$1"', 'wif-probe', shellMarker,
 ], shellMarker);
+if (!shellStage.facts.passed) {
+  process.stderr.write('Sandbox shell marker control failed; later stages skipped.\n');
+  process.exit(1);
+}
 const inlineStage = sandboxStage('sandbox-node-inline', [
-  process.env.PROBE_NODE, '-e', `process.stdout.write(${JSON.stringify(stageMarker)} + '\\n')`,
+  process.env.PROBE_NODE, '-e', `process.stdout.write(${JSON.stringify(stageMarker + '\n')})`,
 ], stageMarker);
+if (!inlineStage.facts.passed || !inlineStage.facts.nodePathIsAbsolute) {
+  process.stderr.write('Sandbox Node inline marker control failed; actual probe skipped.\n');
+  process.exit(1);
+}
 const probePath = process.env.GITHUB_WORKSPACE + '/probe/linux-isolation/probe.mjs';
 const nodeToolStage = sandboxStage('sandbox-node-tool', [
   process.env.PROBE_NODE, probePath, 'tool', JSON.stringify(targets),
 ], 'WIF_ISOLATION_PROBE');
 const child = nodeToolStage.result;
-if (child.error || child.signal || child.status !== 0) {
-  process.stderr.write('Sandboxed Node probe command did not complete successfully; observations incomplete.\n');
-  process.exit(child.status ?? 1);
+if (!nodeToolStage.facts.passed || !nodeToolStage.facts.nodePathIsAbsolute) {
+  process.stderr.write('Sandboxed Node probe did not produce a complete receipt; observations incomplete.\n');
+  process.exit(child.status != null && child.status !== 0 ? child.status : 1);
 }
 
 const sandboxLine = (child.stdout ?? '').split('\n').find(line => line.startsWith('WIF_ISOLATION_PROBE '));
