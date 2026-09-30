@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
@@ -32,6 +32,97 @@ function sudo(args) {
   });
   assert.equal(result.status, 0, result.stderr);
   return result.stdout.trim();
+}
+
+function runDropSudoCancellation(launchCommand, paths) {
+  const child = spawn("sudo", launchCommand, {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  let signalsSent = false;
+  let secondSignalSent = false;
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+
+  return new Promise((resolve, reject) => {
+    const forceCleanup = () => {
+      try {
+        const pid = readFileSync(paths.pid, "utf8").trim();
+        if (/^\d+$/.test(pid)) {
+          spawnSync("sudo", ["-n", "/bin/kill", "-KILL", pid], {
+            stdio: "ignore",
+          });
+        }
+        const actionPid = readFileSync(paths.actionPid, "utf8").trim();
+        if (/^\d+$/.test(actionPid)) {
+          spawnSync("sudo", ["-n", "/bin/kill", "-KILL", actionPid], {
+            stdio: "ignore",
+          });
+        }
+      } catch {
+        // The action or descendant may not have started yet.
+      }
+      child.kill("SIGKILL");
+    };
+    const deadline = setTimeout(() => {
+      clearInterval(poll);
+      forceCleanup();
+      reject(new Error("drop-sudo cancellation test timed out"));
+    }, 30_000);
+    const poll = setInterval(() => {
+      if (signalsSent || !existsSync(paths.term)) return;
+      signalsSent = true;
+      const actionPid = Number(readFileSync(paths.actionPid, "utf8"));
+      const signalAction = (signal) =>
+        spawnSync("sudo", ["-n", "-u", paths.user, "--", "/bin/kill", `-${signal}`, String(actionPid)], {
+          stdio: "ignore",
+        }).status === 0;
+      if (!signalAction("SIGINT")) {
+        clearTimeout(deadline);
+        clearInterval(poll);
+        forceCleanup();
+        reject(new Error("could not send SIGINT to the temporary drop-sudo action"));
+        return;
+      }
+      setTimeout(() => { secondSignalSent = signalAction("SIGTERM"); }, 150);
+    }, 20);
+
+    child.once("close", async (status, signal) => {
+      clearTimeout(deadline);
+      clearInterval(poll);
+      const heartbeatAtClose = (() => {
+        try {
+          return readFileSync(paths.heartbeat, "utf8").length;
+        } catch {
+          return -1;
+        }
+      })();
+      await new Promise((done) => setTimeout(done, 150));
+      const descendantStopped =
+        heartbeatAtClose >= 0 &&
+        readFileSync(paths.heartbeat, "utf8").length === heartbeatAtClose;
+      const descendantReceivedTerm =
+        existsSync(paths.term) && readFileSync(paths.term, "utf8") === "received";
+      try {
+        spawnSync("sudo", ["-n", "/bin/kill", "-KILL", readFileSync(paths.pid, "utf8")], {
+          stdio: "ignore",
+        });
+      } catch {
+        // The descendant was already terminated by the action.
+      }
+      resolve({
+        status,
+        signal,
+        stdout,
+        stderr,
+        signalsSent,
+          secondSignalSent,
+        descendantReceivedTerm,
+        descendantStopped,
+      });
+    });
+  });
 }
 
 function snapshotRootSockets() {
@@ -153,8 +244,13 @@ test(
         userAliasSudoGrant: true,
       },
       { name: "remaining sudo grants fail closed", remainingSudoGrant: true },
+      {
+        name: "runtime deadline and repeated cancellation terminate descendants",
+        cancelDescendant: true,
+        timeoutSeconds: 5,
+      },
     ].entries()) {
-      await t.test(scenario.name, { timeout: 45_000 }, (subtest) => {
+      await t.test(scenario.name, { timeout: 45_000 }, async (subtest) => {
         const suffix = `${process.pid}${Date.now().toString(36)}${index}`;
         const user = `codexdrop${suffix}`;
         const privilegedGroup = `cdxp${suffix}`;
@@ -164,6 +260,12 @@ test(
           path.join(tmpdir(), "codex-action-drop-sudo-")
         );
         const capturePath = path.join(tempDir, "capture.json");
+        const actionPidPath = path.join(tempDir, "action.pid");
+        const descendantReadyPath = path.join(tempDir, "descendant.ready");
+        const descendantTermPath = path.join(tempDir, "descendant.term");
+        const descendantPidPath = path.join(tempDir, "descendant.pid");
+        const descendantHeartbeatPath = path.join(tempDir, "descendant.heartbeat");
+        const actionLauncherPath = path.join(tempDir, "run-action");
         const outputPath = path.join(tempDir, "output.md");
         const codexPath = path.join(tempDir, "codex");
         const bundledActionPath = path.join(tempDir, "main.js");
@@ -323,11 +425,19 @@ test(
         }
 
         copyFileSync(mainPath, bundledActionPath);
+        if (scenario.cancelDescendant) {
+          writeFileSync(
+            actionLauncherPath,
+            '#!/bin/sh\nprintf \'%s\\n\' "$$" > "$CODEX_ACTION_PID_FILE"\nexec "$@"\n'
+          );
+          chmodSync(actionLauncherPath, 0o755);
+        }
         writeFileSync(
           codexPath,
           `#!${process.execPath}
 const { accessSync, constants, readFileSync, writeFileSync } = require("node:fs");
-const { spawnSync } = require("node:child_process");
+const { appendFileSync } = require("node:fs");
+const { spawn, spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
 const output = args[args.indexOf("--output-last-message") + 1];
 function canWrite(socket) {
@@ -384,9 +494,16 @@ writeFileSync(process.env.CODEX_CAPTURE_PATH, JSON.stringify({
   prompt: readFileSync(0, "utf8"),
 }));
 writeFileSync(output, "fake final message\\n");
+if (process.env.CODEX_CANCEL_DESCENDANT === "1") {
+  spawn(process.execPath, ["-e", 'const fs = require("node:fs"); process.on("SIGTERM", () => fs.writeFileSync(process.env.CODEX_DESCENDANT_TERM, "received")); fs.writeFileSync(process.env.CODEX_DESCENDANT_READY, "ready"); fs.writeFileSync(process.env.CODEX_DESCENDANT_PID, String(process.pid)); setInterval(() => fs.appendFileSync(process.env.CODEX_DESCENDANT_HEARTBEAT, "x"), 50);'], { stdio: "ignore" });
+  setInterval(() => {}, 1000);
+}
 `
         );
         chmodSync(codexPath, 0o755);
+        if (scenario.cancelDescendant) {
+          sudo(["chown", user, actionLauncherPath]);
+        }
         chmodSync(tempDir, 0o711);
         sudo(["chown", "-R", user, tempDir]);
 
@@ -403,6 +520,16 @@ writeFileSync(output, "fake final message\\n");
           `CODEX_SERVICE_SOCKET=${serviceSocket}`,
           `CODEX_WORLD_SOCKET=${worldSocket}`,
           `CODEX_FALLBACK_SOCKET=${fallbackSocket}`,
+          ...(scenario.cancelDescendant
+            ? [
+                "CODEX_CANCEL_DESCENDANT=1",
+                `CODEX_DESCENDANT_READY=${descendantReadyPath}`,
+                `CODEX_DESCENDANT_TERM=${descendantTermPath}`,
+                `CODEX_DESCENDANT_PID=${descendantPidPath}`,
+                `CODEX_DESCENDANT_HEARTBEAT=${descendantHeartbeatPath}`,
+                `CODEX_ACTION_PID_FILE=${actionPidPath}`,
+              ]
+            : []),
           ...(canTestSocketAcls
             ? [
                 `CODEX_NAMED_USER_ACL_SOCKET=${namedUserAclSocket}`,
@@ -441,7 +568,13 @@ writeFileSync(output, "fake final message\\n");
           "drop-sudo",
           "--codex-user",
           "",
+          "--timeout-seconds",
+          String(scenario.timeoutSeconds ?? 1200),
         ];
+        if (scenario.cancelDescendant) {
+          const nodeIndex = command.indexOf(process.execPath);
+          command.splice(nodeIndex, 1, actionLauncherPath, process.execPath);
+        }
         const launchCommand = scenario.staleGroups
           ? [
               ...command.slice(0, 4),
@@ -451,10 +584,37 @@ writeFileSync(output, "fake final message\\n");
               ...command.slice(4),
             ]
           : command;
-        const result = spawnSync("sudo", launchCommand, {
-          encoding: "utf8",
-          timeout: 35_000,
-        });
+        const result = scenario.cancelDescendant
+          ? await runDropSudoCancellation(launchCommand, {
+              actionPid: actionPidPath,
+              term: descendantTermPath,
+              heartbeat: descendantHeartbeatPath,
+              pid: descendantPidPath,
+              user,
+            })
+          : spawnSync("sudo", launchCommand, {
+              encoding: "utf8",
+              timeout: 35_000,
+            });
+
+        if (scenario.cancelDescendant) {
+          assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`);
+          assert.match(result.stderr, /Codex execution cancelled: timeout after 5 seconds/);
+          assert.equal(result.signalsSent, true);
+          assert.equal(result.secondSignalSent, true);
+          assert.equal(result.descendantReceivedTerm, true);
+          assert.equal(result.descendantStopped, true);
+          const capture = JSON.parse(readFileSync(capturePath, "utf8"));
+          assert.equal(capture.uid, userId);
+          assert.equal(capture.gid, safeGroup);
+          assert.deepEqual(capture.groups, [safeGroup]);
+          assert.equal(capture.supplementaryGroups, "");
+          assert.equal(capture.noNewPrivs, "1");
+          assert.equal(capture.capBounding, "0000000000000000");
+          assert.equal(capture.capEffective, "0000000000000000");
+          assert.equal(capture.capPermitted, "0000000000000000");
+          return;
+        }
 
         if (scenario.rejectedBeforeCleanup) {
           assert.notEqual(result.status, 0);

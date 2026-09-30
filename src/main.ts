@@ -172,6 +172,12 @@ export async function main() {
       "--codex-user <user>",
       "User to run codex exec as when using the 'unprivileged-user' safety strategy."
     )
+    .option(
+      "--timeout-seconds <seconds>",
+      "Execution deadline in seconds; 0 disables it.",
+      parseTimeoutSeconds,
+      1200
+    )
     .action(
       async (options: {
         prompt: string;
@@ -188,6 +194,7 @@ export async function main() {
         effort: string;
         safetyStrategy: string;
         codexUser: string;
+        timeoutSeconds: number;
       }) => {
         const {
           prompt,
@@ -204,6 +211,7 @@ export async function main() {
           effort,
           safetyStrategy,
           codexUser,
+          timeoutSeconds,
         } = options;
 
         const normalizedPrompt = emptyAsNull(prompt);
@@ -265,6 +273,7 @@ export async function main() {
           effort: emptyAsNull(effort),
           safetyStrategy: toSafetyStrategy(safetyStrategy),
           codexUser: emptyAsNull(codexUser),
+          timeoutSeconds,
         });
       }
     );
@@ -326,6 +335,14 @@ function parseIntStrict(value: string): number {
   const parsed = parseInt(value, 10);
   if (isNaN(parsed)) {
     throw new Error(`Invalid integer: ${value}`);
+  }
+  return parsed;
+}
+
+function parseTimeoutSeconds(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > 2_147_483) {
+    throw new Error("Timeout seconds must be an integer between 0 and 2147483.");
   }
   return parsed;
 }

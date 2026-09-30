@@ -134,6 +134,7 @@ export async function runCodexExec({
   codexUser,
   sandbox,
   permissionProfile,
+  timeoutSeconds,
 }: {
   prompt: PromptSource;
   codexHome: string | null;
@@ -147,6 +148,7 @@ export async function runCodexExec({
   codexUser: string | null;
   sandbox: SandboxMode | null;
   permissionProfile: string | null;
+  timeoutSeconds: number;
 }): Promise<void> {
   let input: string;
   switch (prompt.type) {
@@ -320,6 +322,7 @@ export async function runCodexExec({
       const child = spawn(program, command, {
         env,
         stdio: ["pipe", "pipe", "pipe"],
+        detached: process.platform !== "win32",
       });
       if (telemetry == null) {
         child.stdout.pipe(process.stdout, { end: false });
@@ -343,14 +346,89 @@ export async function runCodexExec({
         child.stderr.destroy();
       };
 
+      let settled = false;
+      let terminationReason: string | null = null;
+      let killTimer: NodeJS.Timeout | undefined;
+      const terminate = (reason: string) => {
+        if (terminationReason != null) return;
+        terminationReason = reason;
+        try {
+          if (process.platform === "win32") {
+            if (child.pid != null) {
+              const taskkill = spawn("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], {
+                stdio: "ignore",
+                windowsHide: true,
+              });
+              taskkill.once("error", () => child.kill("SIGTERM"));
+              taskkill.unref();
+            } else {
+              child.kill("SIGTERM");
+            }
+          } else if (child.pid != null) {
+            process.kill(-child.pid, "SIGTERM");
+          }
+        } catch {
+          // The child may have exited between the event and the signal.
+        }
+        killTimer = setTimeout(() => {
+          try {
+            if (process.platform !== "win32" && child.pid != null) {
+              process.kill(-child.pid, "SIGKILL");
+            }
+          } catch {
+            // The process group may already be gone.
+          }
+        }, TERMINATION_GRACE_MS);
+      };
+      const onSigint = () => terminate("SIGINT");
+      const onSigterm = () => terminate("SIGTERM");
+      process.on?.("SIGINT", onSigint);
+      process.on?.("SIGTERM", onSigterm);
+      const timeoutHandle =
+        timeoutSeconds > 0
+          ? setTimeout(
+              () => terminate(`timeout after ${timeoutSeconds} seconds`),
+              timeoutSeconds * 1000
+            )
+          : undefined;
+
+      const cleanupLifecycle = () => {
+        clearTimeout(timeoutHandle);
+        clearTimeout(killTimer);
+        process.off?.("SIGINT", onSigint);
+        process.off?.("SIGTERM", onSigterm);
+      };
+
       child.once("error", (err) => {
+        cleanupLifecycle();
+        settled = true;
         closeOutputStreams();
         reject(err);
       });
 
       child.once("exit", async (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        if (terminationReason != null) {
+          // Keep the process group bounded even when the direct child exits on TERM
+          // while one of its descendants ignores the cancellation signal.
+          await new Promise((resolve) => setTimeout(resolve, TERMINATION_GRACE_MS));
+          try {
+            if (process.platform !== "win32" && child.pid != null) {
+              process.kill(-child.pid, "SIGKILL");
+            }
+          } catch {
+            // The process group may already be gone.
+          }
+        }
+        cleanupLifecycle();
         await drainOutputStreams([child.stdout, child.stderr]);
         closeOutputStreams();
+        if (terminationReason != null) {
+          reject(new Error(`Codex execution cancelled: ${terminationReason}`));
+          return;
+        }
         if (telemetry != null) {
           try {
             const summary = telemetry.finish();
@@ -386,6 +464,7 @@ export async function runCodexExec({
 
 const OUTPUT_DRAIN_QUIET_MS = 25;
 const OUTPUT_DRAIN_TIMEOUT_MS = 1_000;
+const TERMINATION_GRACE_MS = 1_000;
 
 /**
  * Lets libuv deliver output that was already buffered when the direct child exited. Descendants
