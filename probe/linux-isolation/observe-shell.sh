@@ -35,6 +35,13 @@ if proc_has "$parent_pid" 'SYNTHETIC_OPENAI_API_ACCESS_TOKEN=eyJ.synthetic-opena
 
 if [ -d "/proc/$root_pid" ]; then root_process_exists=true; else root_process_exists=false; fi
 if proc_has "$root_pid" 'PROBE_ROOT_PROC_CANARY=synthetic-root-process-oidc-token-canary'; then root_process_env=true; else root_process_env=false; fi
+if [ -e "$root_file" ]; then root_file_path_exists=true; else root_file_path_exists=false; fi
+root_file_stat="$(stat -c '%u %a' "$root_file" 2>/dev/null || true)"
+if [ -n "$root_file_stat" ]; then root_file_metadata_readable=true; else root_file_metadata_readable=false; fi
+root_file_owner="${root_file_stat%% *}"
+root_file_mode="${root_file_stat#* }"
+if [ "$root_file_owner" = 0 ]; then root_file_owner_is_root=true; else root_file_owner_is_root=false; fi
+if [ "$root_file_mode" = 600 ]; then root_file_mode0600=true; else root_file_mode0600=false; fi
 if [ -r "$root_file" ] && [ "$(cat "$root_file" 2>/dev/null)" = 'synthetic-root-owned-subject-token-file-canary' ]; then root_file_readable=true; else root_file_readable=false; fi
 if [ -r "$control_file" ] && [ "$(cat "$control_file" 2>/dev/null)" = 'synthetic-runner-control-file-canary' ]; then control_file_readable=true; else control_file_readable=false; fi
 
@@ -49,11 +56,12 @@ if [ "$same_uid_file_mode" = 600 ]; then same_uid_file_mode0600=true; else same_
 same_uid_file_owner="$(stat -c '%u' "$same_uid_file" 2>/dev/null || true)"
 if [ -n "$same_uid_file_owner" ] && [ "$same_uid_file_owner" = "$same_uid_process_uid" ] && [ "$same_uid_file_owner" = "$expected_runner_uid" ]; then same_uid_file_owner_matches_process=true; else same_uid_file_owner_matches_process=false; fi
 
-printf 'WIF_SHELL_ISOLATION_PROBE {"label":"%s","processEnv":{"oidcRequestUrl":%s,"oidcRequestToken":%s,"subjectToken":%s,"apiKey":%s,"apiAccessToken":%s},"wrapperParentProcEnv":{"oidcRequestToken":%s,"subjectToken":%s,"apiKey":%s,"apiAccessToken":%s},"rootProcessExists":%s,"rootProcessProcEnv":%s,"rootOwnedFileReadable":%s,"runnerControlFileReadable":%s,"sameUidHolder":{"pidVisible":%s,"authEnvReadable":%s,"uidMatchesProcess":%s,"fileReadable":%s,"fileMode0600":%s,"fileOwnerMatchesProcess":%s}}\n' \
+printf 'WIF_SHELL_ISOLATION_PROBE {"label":"%s","processEnv":{"oidcRequestUrl":%s,"oidcRequestToken":%s,"subjectToken":%s,"apiKey":%s,"apiAccessToken":%s},"wrapperParentProcEnv":{"oidcRequestToken":%s,"subjectToken":%s,"apiKey":%s,"apiAccessToken":%s},"rootProcessExists":%s,"rootProcessProcEnv":%s,"rootFilePathExists":%s,"rootFileMetadataReadable":%s,"rootFileOwnerIsRoot":%s,"rootFileMode0600":%s,"rootOwnedFileReadable":%s,"runnerControlFileReadable":%s,"sameUidHolder":{"pidVisible":%s,"authEnvReadable":%s,"uidMatchesProcess":%s,"fileReadable":%s,"fileMode0600":%s,"fileOwnerMatchesProcess":%s}}\n' \
   "$label" \
   "$oidc_url" "$oidc_token" "$subject_token" "$api_key" "$api_access_token" \
   "$parent_oidc_token" "$parent_subject_token" "$parent_api_key" "$parent_api_access_token" \
-  "$root_process_exists" "$root_process_env" "$root_file_readable" "$control_file_readable" \
+  "$root_process_exists" "$root_process_env" "$root_file_path_exists" "$root_file_metadata_readable" \
+  "$root_file_owner_is_root" "$root_file_mode0600" "$root_file_readable" "$control_file_readable" \
   "$same_uid_pid_visible" "$same_uid_auth_env_readable" "$same_uid_uid_matches_process" \
   "$same_uid_file_readable" "$same_uid_file_mode0600" "$same_uid_file_owner_matches_process"
 

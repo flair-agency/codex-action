@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, statSync, chmodSync, renameSync } from 'node:fs';
+import { basename, dirname, isAbsolute } from 'node:path';
 
 const canaries = {
   ACTIONS_ID_TOKEN_REQUEST_URL: 'http://127.0.0.1:9/mock-oidc?audience=synthetic-probe',
@@ -15,6 +15,8 @@ const runnerFileCanary = 'synthetic-runner-control-file-canary';
 const sameUidHolderEnvName = 'SYNTHETIC_SAME_UID_AUTH_HOLDER';
 const sameUidHolderCanary = 'synthetic-same-uid-auth-holder-canary';
 const sameUidHolderFileCanary = 'synthetic-same-uid-holder-file-canary';
+const rootRequestMarker = 'synthetic-root-postcheck-request-v1';
+const rootAckMarker = 'synthetic-root-postcheck-ack-v1';
 const stageMarker = 'WIF_NODE_STAGE_CONTROL_OK';
 
 function parseProcStat(statText, expectedPid) {
@@ -100,6 +102,114 @@ function fileEquals(file, expected) {
   }
 }
 
+function rootFileFacts(file, initialStats = null) {
+  let stats = null;
+  try { stats = statSync(file); } catch {}
+  return {
+    pathExists: existsSync(file),
+    metadataReadable: stats !== null,
+    ownerIsRoot: stats !== null && stats.uid === 0,
+    mode0600: stats !== null && (stats.mode & 0o777) === 0o600,
+    contentMatches: fileEquals(file, rootFileCanary),
+    identityMatches: initialStats !== null && stats !== null &&
+      stats.dev === initialStats.dev && stats.ino === initialStats.ino,
+  };
+}
+
+function writeBooleanReceipt(file, facts) {
+  if (Object.values(facts).some(value => typeof value !== 'boolean')) {
+    throw new Error('Invalid synthetic receipt.');
+  }
+  const temporary = `${file}.tmp-${process.pid}`;
+  writeFileSync(temporary, `${JSON.stringify(facts)}\n`, { mode: 0o600, flag: 'wx' });
+  chmodSync(temporary, 0o644);
+  renameSync(temporary, file);
+}
+
+function readBooleanReceipt(file, expectedKeys) {
+  try {
+    const value = JSON.parse(readFileSync(file, 'utf8'));
+    const keys = Object.keys(value).sort();
+    if (JSON.stringify(keys) !== JSON.stringify([...expectedKeys].sort()) ||
+        Object.values(value).some(item => typeof item !== 'boolean')) return null;
+    const stats = statSync(file);
+    return { value, ownerIsRoot: stats.uid === 0, mode0644: (stats.mode & 0o777) === 0o644 };
+  } catch {
+    return null;
+  }
+}
+
+const rootReadyKeys = [
+  'helperIsRoot', 'helperAlive', 'procCanaryPresent', 'procEnvironmentCanaryPresent', 'filePathExists',
+  'fileMetadataReadable', 'fileOwnerIsRoot', 'fileMode0600', 'fileContentMatches', 'valid',
+];
+const rootPostKeys = [
+  'helperIsRoot', 'requestMarkerValid', 'filePathExists', 'fileMetadataReadable',
+  'fileOwnerIsRoot', 'fileMode0600', 'fileContentMatches', 'fileIdentityMatches', 'valid',
+];
+
+async function runRootHolder(args) {
+  const [rootFile, readyFile, requestFile, receiptFile, ackFile, pidFile, startFile] = args;
+  const names = [basename(rootFile ?? ''), basename(readyFile ?? ''), basename(requestFile ?? ''),
+    basename(receiptFile ?? ''), basename(ackFile ?? ''), basename(pidFile ?? ''), basename(startFile ?? '')];
+  const expectedNames = ['wif-root-owned-canary', 'wif-root-ready.json', 'wif-root-post-request',
+    'wif-root-post-receipt.json', 'wif-root-post-ack', 'wif-root-process.pid',
+    'wif-root-process-starttime'];
+  const allPathsFixed = args.length === 7 && args.every(isAbsolute) &&
+    JSON.stringify(names) === JSON.stringify(expectedNames) && args.every(file => dirname(file) === dirname(rootFile));
+  if (!allPathsFixed || process.env.NODE_OPTIONS) process.exit(2);
+
+  let initialStats = null;
+  try { initialStats = statSync(rootFile); } catch {}
+  const identity = readProcStat(process.pid);
+  const preFile = rootFileFacts(rootFile);
+  const helperIsRoot = process.getuid?.() === 0;
+  const readyFacts = {
+    helperIsRoot,
+    helperAlive: identity?.alive === true,
+    procCanaryPresent: process.env.PROBE_ROOT_PROC_CANARY === rootProcCanary,
+    procEnvironmentCanaryPresent: procContains(process.pid, `PROBE_ROOT_PROC_CANARY=${rootProcCanary}`),
+    filePathExists: preFile.pathExists,
+    fileMetadataReadable: preFile.metadataReadable,
+    fileOwnerIsRoot: preFile.ownerIsRoot,
+    fileMode0600: preFile.mode0600,
+    fileContentMatches: preFile.contentMatches,
+    valid: false,
+  };
+  readyFacts.valid = Object.entries(readyFacts).every(([key, value]) => key === 'valid' || value === true);
+  writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o600 });
+  if (identity?.alive) writeFileSync(startFile, `${identity.startTime}\n`, { mode: 0o600 });
+  writeBooleanReceipt(readyFile, readyFacts);
+  process.stdout.write(`WIF_ROOT_HOLDER_READY ${JSON.stringify(readyFacts)}\n`);
+  if (!readyFacts.valid || !initialStats || !identity?.alive) process.exit(1);
+
+  const deadline = Date.now() + 300_000;
+  while (Date.now() < deadline && !fileEquals(requestFile, rootRequestMarker)) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  const requestMarkerValid = fileEquals(requestFile, rootRequestMarker);
+  const postFile = rootFileFacts(rootFile, initialStats);
+  const postFacts = {
+    helperIsRoot: process.getuid?.() === 0,
+    requestMarkerValid,
+    filePathExists: postFile.pathExists,
+    fileMetadataReadable: postFile.metadataReadable,
+    fileOwnerIsRoot: postFile.ownerIsRoot,
+    fileMode0600: postFile.mode0600,
+    fileContentMatches: postFile.contentMatches,
+    fileIdentityMatches: postFile.identityMatches,
+    valid: false,
+  };
+  postFacts.valid = Object.entries(postFacts).every(([key, value]) => key === 'valid' || value === true);
+  writeBooleanReceipt(receiptFile, postFacts);
+  process.stdout.write(`WIF_ROOT_HOLDER_POST ${JSON.stringify(postFacts)}\n`);
+
+  while (Date.now() < deadline && !fileEquals(ackFile, rootAckMarker)) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  process.exit(fileEquals(ackFile, rootAckMarker) ? 0 : 1);
+}
+
 function inspect(label, targets) {
   const processEnv = Object.fromEntries(Object.entries(canaries).map(([name, expected]) => [
     name,
@@ -109,6 +219,7 @@ function inspect(label, targets) {
   const sameUid = targets.sameUidHolderPid;
   const holderUids = readProcUids(sameUid);
   const effectiveUid = process.geteuid?.() ?? process.getuid?.();
+  const rootPathFacts = rootFileFacts(targets.rootFile);
   let sameUidFileStats;
   try {
     sameUidFileStats = statSync(targets.sameUidHolderFile);
@@ -126,7 +237,11 @@ function inspect(label, targets) {
     },
     rootProcessExists: existsSync(`/proc/${rootPid}`),
     rootProcessProcEnv: procContains(rootPid, rootProcCanary),
-    rootOwnedFileReadable: fileEquals(rootFile, rootFileCanary),
+    rootFilePathExists: rootPathFacts.pathExists,
+    rootFileMetadataReadable: rootPathFacts.metadataReadable,
+    rootFileOwnerIsRoot: rootPathFacts.ownerIsRoot,
+    rootFileMode0600: rootPathFacts.mode0600,
+    rootOwnedFileReadable: rootPathFacts.contentMatches,
     runnerControlFileReadable: fileEquals(controlFile, runnerFileCanary),
     sameUidHolder: {
       pidVisible: existsSync(`/proc/${sameUid}`),
@@ -150,6 +265,52 @@ if (mode === 'test-proc-stat-parser') {
   const valid = normal?.state === 'S' && normal.startTime === '98765' && normal.alive &&
     zombie?.state === 'Z' && !zombie.alive && dead?.state === 'X' && !dead.alive && wrongPid == null;
   process.stdout.write(`WIF_PROC_STAT_FIXTURES ${JSON.stringify({ valid })}\n`);
+  process.exit(valid ? 0 : 1);
+}
+
+if (mode === 'root-holder') {
+  await runRootHolder(args);
+}
+
+if (mode === 'verify-root-ready') {
+  const [readyFile] = args;
+  const receipt = readBooleanReceipt(readyFile, rootReadyKeys);
+  const receiptValid = receipt !== null;
+  const receiptOwnerIsRoot = receipt?.ownerIsRoot === true;
+  const receiptMode0644 = receipt?.mode0644 === true;
+  const controlsPositive = receiptValid && Object.values(receipt.value).every(Boolean);
+  const valid = receiptValid && receiptOwnerIsRoot && receiptMode0644 && controlsPositive;
+  process.stdout.write(`WIF_ROOT_READY_CHECK ${JSON.stringify({ receiptValid, receiptOwnerIsRoot, receiptMode0644, controlsPositive, valid })}\n`);
+  process.exit(valid ? 0 : 1);
+}
+
+if (mode === 'verify-root-post') {
+  const [rootPid, expectedStartTime, rootFile, receiptFile, ackFile] = args;
+  const receipt = readBooleanReceipt(receiptFile, rootPostKeys);
+  const receiptValid = receipt !== null;
+  const receiptOwnerIsRoot = receipt?.ownerIsRoot === true;
+  const receiptMode0644 = receipt?.mode0644 === true;
+  const identity = readProcStat(rootPid);
+  const holderIdentityReadable = identity !== null;
+  const holderAlive = holderIdentityReadable && identity.alive === true;
+  const holderIdentityMatches = holderAlive && identity.startTime === expectedStartTime;
+  const runnerFile = rootFileFacts(rootFile);
+  const ackWritten = Boolean(receiptValid && receiptOwnerIsRoot && receiptMode0644 &&
+    receipt.value.requestMarkerValid && receipt.value.helperIsRoot && holderIdentityMatches);
+  if (ackWritten) writeFileSync(ackFile, rootAckMarker, { mode: 0o600 });
+  const receiptControlsPositive = receiptValid && Object.values(receipt.value).every(Boolean);
+  const rootFilePathExists = runnerFile.pathExists;
+  const rootFileMetadataReadable = runnerFile.metadataReadable;
+  const rootFileOwnerIsRoot = runnerFile.ownerIsRoot;
+  const rootFileMode0600 = runnerFile.mode0600;
+  const rootFileContentReadable = runnerFile.contentMatches;
+  const valid = ackWritten && receiptControlsPositive;
+  process.stdout.write(`WIF_ROOT_POST_CHECK ${JSON.stringify({
+    receiptValid, receiptOwnerIsRoot, receiptMode0644, receiptControlsPositive,
+    holderIdentityReadable, holderAlive, holderIdentityMatches, ackWritten,
+    rootFilePathExists, rootFileMetadataReadable, rootFileOwnerIsRoot, rootFileMode0600,
+    rootFileContentReadable, valid,
+  })}\n`);
   process.exit(valid ? 0 : 1);
 }
 
@@ -277,7 +438,8 @@ const hasExactKeys = (value, expectedKeys) => value != null &&
 const processEnvKeys = ['oidcRequestUrl', 'oidcRequestToken', 'subjectToken', 'apiKey', 'apiAccessToken'];
 const receiptKeys = [
   'label', 'processEnv', 'wrapperParentProcEnv', 'rootProcessExists',
-  'rootProcessProcEnv', 'rootOwnedFileReadable', 'runnerControlFileReadable', 'sameUidHolder',
+  'rootProcessProcEnv', 'rootFilePathExists', 'rootFileMetadataReadable', 'rootFileOwnerIsRoot',
+  'rootFileMode0600', 'rootOwnedFileReadable', 'runnerControlFileReadable', 'sameUidHolder',
 ];
 const sameUidHolderKeys = [
   'pidVisible', 'authEnvReadable', 'uidMatchesProcess', 'fileReadable', 'fileMode0600', 'fileOwnerMatchesProcess',
@@ -295,6 +457,10 @@ function parseShellReceipt(result, expectedLabel) {
     hasBooleanKeys(facts.wrapperParentProcEnv, ['oidcRequestToken', 'subjectToken', 'apiKey', 'apiAccessToken']) &&
     typeof facts.rootProcessExists === 'boolean' &&
     typeof facts.rootProcessProcEnv === 'boolean' &&
+    typeof facts.rootFilePathExists === 'boolean' &&
+    typeof facts.rootFileMetadataReadable === 'boolean' &&
+    typeof facts.rootFileOwnerIsRoot === 'boolean' &&
+    typeof facts.rootFileMode0600 === 'boolean' &&
     typeof facts.rootOwnedFileReadable === 'boolean' &&
     typeof facts.runnerControlFileReadable === 'boolean' &&
     hasBooleanKeys(facts.sameUidHolder, sameUidHolderKeys);

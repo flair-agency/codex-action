@@ -52,6 +52,10 @@ jobs:
           PROBE_ROOT_FILE: ${{ runner.temp }}/wif-root-owned-canary
           PROBE_ROOT_PID_FILE: ${{ runner.temp }}/wif-root-process.pid
           PROBE_ROOT_START_FILE: ${{ runner.temp }}/wif-root-process-starttime
+          PROBE_ROOT_READY_FILE: ${{ runner.temp }}/wif-root-ready.json
+          PROBE_ROOT_REQUEST_FILE: ${{ runner.temp }}/wif-root-post-request
+          PROBE_ROOT_POST_FILE: ${{ runner.temp }}/wif-root-post-receipt.json
+          PROBE_ROOT_ACK_FILE: ${{ runner.temp }}/wif-root-post-ack
           PROBE_SAME_UID_HOLDER_PID_FILE: ${{ runner.temp }}/wif-same-uid-holder.pid
           PROBE_SAME_UID_HOLDER_START_FILE: ${{ runner.temp }}/wif-same-uid-holder-starttime
           PROBE_SAME_UID_HOLDER_FILE: ${{ runner.temp }}/wif-same-uid-holder-canary
@@ -77,7 +81,10 @@ jobs:
           mkdir -p "$PROBE_CODEX_HOME" "$PROBE_BIN_DIR"
           sudo install -o root -g root -m 600 /dev/null "$PROBE_ROOT_FILE"
           printf '%s' "$PROBE_ROOT_FILE_CANARY" | sudo tee "$PROBE_ROOT_FILE" >/dev/null
-          sudo install -o root -g root -m 600 /dev/null "$PROBE_ROOT_START_FILE"
+          : > "$PROBE_ROOT_REQUEST_FILE"
+          chmod 600 "$PROBE_ROOT_REQUEST_FILE"
+          : > "$PROBE_ROOT_ACK_FILE"
+          chmod 600 "$PROBE_ROOT_ACK_FILE"
           printf '%s' 'synthetic-same-uid-holder-file-canary' > "$PROBE_SAME_UID_HOLDER_FILE"
           chmod 600 "$PROBE_SAME_UID_HOLDER_FILE"
           printf '%s' 'synthetic-runner-control-file-canary' > "$PROBE_CONTROL_FILE"
@@ -102,28 +109,27 @@ jobs:
           export PROBE_SAME_UID_EXPECTED_UID="$(id -u)"
           export PROBE_SAME_UID_PREFLIGHT_VALID=true
 
-          sudo env \
+          sudo env -u NODE_OPTIONS \
             PROBE_ROOT_PROC_CANARY="$PROBE_ROOT_PROC_CANARY" \
-            PROBE_ROOT_PID_FILE="$PROBE_ROOT_PID_FILE" \
-            sh -c 'printf "%s" "$$" > "$PROBE_ROOT_PID_FILE"; exec sleep 300' \
+            "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" root-holder \
+            "$PROBE_ROOT_FILE" "$PROBE_ROOT_READY_FILE" "$PROBE_ROOT_REQUEST_FILE" \
+            "$PROBE_ROOT_POST_FILE" "$PROBE_ROOT_ACK_FILE" "$PROBE_ROOT_PID_FILE" "$PROBE_ROOT_START_FILE" \
             >/dev/null 2>&1 &
           for _ in {1..30}; do
-            [[ -s "$PROBE_ROOT_PID_FILE" ]] && break
+            [[ -s "$PROBE_ROOT_READY_FILE" ]] && break
             sleep 0.1
           done
-          test -s "$PROBE_ROOT_PID_FILE"
-          root_pid="$(cat "$PROBE_ROOT_PID_FILE")"
+          test -s "$PROBE_ROOT_READY_FILE"
+          "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
+            verify-root-ready "$PROBE_ROOT_READY_FILE"
+          root_pid="$(sudo cat "$PROBE_ROOT_PID_FILE")"
           export PROBE_ROOT_PID="$root_pid"
-          sudo test -r "/proc/$root_pid/environ"
-          sudo kill -0 "$root_pid"
-          sudo "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
-            verify-controls "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE" "$PROBE_ROOT_START_FILE"
           root_start_time="$(sudo cat "$PROBE_ROOT_START_FILE")"
           [[ "$root_start_time" =~ ^[0-9]+$ ]]
           export PROBE_ROOT_STARTTIME="$root_start_time"
 
           cleanup_probe_holders() {
-            if [[ -n "${root_pid:-}" ]]; then sudo kill "$root_pid" >/dev/null 2>&1 || true; fi
+            if [[ -n "${root_pid:-}" && "${drop_sudo_started:-false}" != true ]]; then sudo kill "$root_pid" >/dev/null 2>&1 || true; fi
             if [[ -n "${same_uid_holder_pid:-}" ]]; then kill "$same_uid_holder_pid" >/dev/null 2>&1 || true; fi
           }
           trap cleanup_probe_holders EXIT
@@ -144,7 +150,8 @@ jobs:
           # This final step removes sudo only on the disposable hosted runner.
           # Findings are visibility observations, not an acceptance decision.
 
-          node "$GITHUB_WORKSPACE/dist/main.js" run-codex-exec \
+          drop_sudo_started=true
+          if node "$GITHUB_WORKSPACE/dist/main.js" run-codex-exec \
             --prompt 'synthetic local sandbox probe; do not call a model' \
             --prompt-file '' \
             --codex-home "$PROBE_CODEX_HOME" \
@@ -159,6 +166,31 @@ jobs:
             --effort '' \
             --safety-strategy 'drop-sudo' \
             --codex-user '' \
-            --timeout-seconds 45
+            --timeout-seconds 45; then
+            action_status=0
+          else
+            action_status=$?
+          fi
+
+          printf '%s' 'synthetic-root-postcheck-request-v1' > "$PROBE_ROOT_REQUEST_FILE"
+          for _ in {1..100}; do
+            [[ -s "$PROBE_ROOT_POST_FILE" ]] && break
+            sleep 0.1
+          done
+          if [[ -s "$PROBE_ROOT_POST_FILE" ]]; then
+            if "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
+              verify-root-post "$root_pid" "$root_start_time" "$PROBE_ROOT_FILE" \
+              "$PROBE_ROOT_POST_FILE" "$PROBE_ROOT_ACK_FILE"; then
+              root_post_status=0
+            else
+              root_post_status=$?
+            fi
+          else
+            echo 'Root holder post-check receipt was not produced.' >&2
+            root_post_status=1
+          fi
+
+          if [[ "$action_status" -ne 0 ]]; then exit "$action_status"; fi
+          if [[ "$root_post_status" -ne 0 ]]; then exit 1; fi
 
           test "$(cat "$RUNNER_TEMP/wif-probe-output.md")" = "Synthetic Linux isolation probe completed."
