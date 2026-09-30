@@ -89,9 +89,10 @@ jobs:
           sudo "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
             verify-controls "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE"
 
-          # Compare the same native sandbox echo outside the action child.
-          # The probe prints only the marker-present bit and byte counts.
-          "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" echo-control direct
+          # Run the real Node fixture directly before comparing CLI sandbox stages.
+          # Its receipt contains only synthetic canary visibility booleans.
+          "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
+            fixture-control "$$" "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE"
 
           cat > "$PROBE_BIN_DIR/codex" <<'SHIM'
           #!/usr/bin/env bash
