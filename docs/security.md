@@ -20,10 +20,10 @@ There is a lot of valuable context that can be used to fuel your invocation of C
 ## Treat lifecycle traces as untrusted diagnostics
 
 `run-codex-exec` may write `codex-action-lifecycle-*.jsonl` under `RUNNER_TEMP`. Records contain
-fixed lifecycle phases, monotonic elapsed milliseconds, and an allowlisted child exit code or
-signal. The trace is best-effort: an absent or partial file leaves unobserved phases unknown and
-does not establish why execution stopped, whether a review completed, or whether acceptance or
-host enforcement was achieved.
+fixed lifecycle phases, monotonic elapsed milliseconds, and, on child exit, a numeric-or-null exit
+code and an allowlisted-or-null signal. The trace is best-effort: an absent or partial file leaves
+unobserved phases unknown and does not establish why execution stopped, whether a review completed,
+or whether acceptance or host enforcement was achieved.
 
 The Codex child shares the job filesystem and can modify or delete the trace; it grants no review,
 acceptance, or host authority. Any future collector must open one validated file without following
