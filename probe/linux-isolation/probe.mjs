@@ -38,11 +38,11 @@ function resultFacts(stage, result, expectedMarker, nodePathMatchesExecPath) {
   return facts;
 }
 
-function sandboxStage(stage, command, expectedMarker) {
+function sandboxStage(stage, command, expectedMarker, childEnv = process.env) {
   const realCodex = process.env.PROBE_REAL_CODEX;
   const result = spawnSync(realCodex, [
     'sandbox', '--permission-profile', ':read-only', '--', ...command,
-  ], { env: process.env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 });
+  ], { env: childEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 });
   return { result, facts: resultFacts(stage, result, expectedMarker,
     process.env.PROBE_NODE === process.execPath) };
 }
@@ -172,60 +172,84 @@ process.stdout.write(`WIF_NODE_DIAGNOSTIC ${JSON.stringify({
 })}\n`);
 
 const shellProbePath = process.env.GITHUB_WORKSPACE + '/probe/linux-isolation/observe-shell.sh';
-const shellObservation = sandboxStage('sandbox-shell-observation', [
-  '/bin/sh', shellProbePath,
-  targets.parentPid, targets.rootPid, targets.rootFile, targets.controlFile, 'shell-sandbox-command',
-], 'WIF_SHELL_ISOLATION_PROBE');
-const child = shellObservation.result;
-const shellLine = (child.stdout ?? '').split('\n').find(line => line.startsWith('WIF_SHELL_ISOLATION_PROBE '));
-let shellFacts;
-try {
-  shellFacts = shellLine ? JSON.parse(shellLine.slice('WIF_SHELL_ISOLATION_PROBE '.length)) : null;
-} catch {
-  shellFacts = null;
-}
+const scrubbedEnv = { ...process.env };
+for (const name of Object.keys(canaries)) delete scrubbedEnv[name];
 const hasBooleanKeys = (value, expectedKeys) => value != null &&
   JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expectedKeys].sort()) &&
   Object.values(value).every(entry => typeof entry === 'boolean');
 const hasExactKeys = (value, expectedKeys) => value != null &&
   JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expectedKeys].sort());
-const structurallyValidShellFacts = hasExactKeys(shellFacts, [
+const processEnvKeys = ['oidcRequestUrl', 'oidcRequestToken', 'subjectToken', 'apiKey', 'apiAccessToken'];
+const receiptKeys = [
   'label', 'processEnv', 'wrapperParentProcEnv', 'rootProcessExists',
   'rootProcessProcEnv', 'rootOwnedFileReadable', 'runnerControlFileReadable',
-]) && shellFacts.label === 'shell-sandbox-command' &&
-  hasBooleanKeys(shellFacts.processEnv, ['oidcRequestUrl', 'oidcRequestToken', 'subjectToken', 'apiKey', 'apiAccessToken']) &&
-  hasBooleanKeys(shellFacts.wrapperParentProcEnv, ['oidcRequestToken', 'subjectToken', 'apiKey', 'apiAccessToken']) &&
-  typeof shellFacts.rootProcessExists === 'boolean' &&
-  typeof shellFacts.rootProcessProcEnv === 'boolean' &&
-  typeof shellFacts.rootOwnedFileReadable === 'boolean' &&
-  typeof shellFacts.runnerControlFileReadable === 'boolean';
-if (structurallyValidShellFacts) process.stdout.write(`WIF_SHELL_ISOLATION_PROBE ${JSON.stringify(shellFacts)}\n`);
-const rootPidVisible = structurallyValidShellFacts && shellFacts.rootProcessExists === true;
-const runnerControlReadable = structurallyValidShellFacts && shellFacts.runnerControlFileReadable === true;
-const completionReasons = [];
-if (!structurallyValidShellFacts) completionReasons.push('receipt_invalid');
-if (structurallyValidShellFacts && !rootPidVisible) completionReasons.push('root_pid_not_visible');
-if (structurallyValidShellFacts && !runnerControlReadable) completionReasons.push('runner_control_unreadable');
-if (!shellObservation.facts.passed) completionReasons.push('sandbox_command_incomplete');
-const controlsComplete = structurallyValidShellFacts && rootPidVisible && runnerControlReadable;
-process.stdout.write(`WIF_SHELL_ISOLATION_COMPLETION ${JSON.stringify({
-  structurallyValid: structurallyValidShellFacts,
-  controlsComplete,
-  rootPidVisible,
-  runnerControlReadable,
-  commandStatus: child.status,
-  commandSignal: child.signal,
-  commandErrorCode: child.error?.code ?? null,
-  reasons: completionReasons,
-})}\n`);
-if (!shellObservation.facts.passed || !structurallyValidShellFacts || !controlsComplete) {
-  process.stderr.write('Sandboxed shell probe receipt incomplete; observations fail closed.\n');
-  process.exit(child.status != null && child.status !== 0 ? child.status : 1);
+];
+function parseShellReceipt(result, expectedLabel) {
+  const line = (result.stdout ?? '').split('\n').find(value => value.startsWith('WIF_SHELL_ISOLATION_PROBE '));
+  let facts;
+  try {
+    facts = line ? JSON.parse(line.slice('WIF_SHELL_ISOLATION_PROBE '.length)) : null;
+  } catch {
+    facts = null;
+  }
+  const valid = hasExactKeys(facts, receiptKeys) && facts.label === expectedLabel &&
+    hasBooleanKeys(facts.processEnv, processEnvKeys) &&
+    hasBooleanKeys(facts.wrapperParentProcEnv, ['oidcRequestToken', 'subjectToken', 'apiKey', 'apiAccessToken']) &&
+    typeof facts.rootProcessExists === 'boolean' &&
+    typeof facts.rootProcessProcEnv === 'boolean' &&
+    typeof facts.rootOwnedFileReadable === 'boolean' &&
+    typeof facts.runnerControlFileReadable === 'boolean';
+  if (valid) process.stdout.write(`WIF_SHELL_ISOLATION_PROBE ${JSON.stringify(facts)}\n`);
+  return { facts, valid };
 }
 
-if (!existsSync(`/proc/${targets.rootPid}`)) {
-  process.stderr.write('Root holder ended during probe; process findings incomplete.\n');
-  process.exit(1);
+const shellCases = [];
+for (const [caseName, childEnv] of [['inherited', process.env], ['scrubbed', scrubbedEnv]]) {
+  const label = `shell-sandbox-${caseName}`;
+  const observation = sandboxStage(`sandbox-shell-observation-${caseName}`, [
+    '/bin/sh', shellProbePath,
+    targets.parentPid, targets.rootPid, targets.rootFile, targets.controlFile, label,
+  ], 'WIF_SHELL_ISOLATION_PROBE', childEnv);
+  const receipt = parseShellReceipt(observation.result, label);
+  shellCases.push({ caseName, observation, ...receipt });
+}
+const inheritedCase = shellCases.find(item => item.caseName === 'inherited');
+const scrubbedCase = shellCases.find(item => item.caseName === 'scrubbed');
+const inheritedCanariesPresent = inheritedCase.valid &&
+  Object.values(inheritedCase.facts.processEnv).every(Boolean);
+const scrubbedCanariesAbsent = scrubbedCase.valid &&
+  Object.values(scrubbedCase.facts.processEnv).every(value => !value);
+const receiptsValid = shellCases.every(item => item.valid);
+const rootPidVisible = receiptsValid && shellCases.every(item => item.facts.rootProcessExists);
+const rootHolderAliveAfter = existsSync(`/proc/${targets.rootPid}`);
+const runnerControlReadable = receiptsValid && shellCases.every(item => item.facts.runnerControlFileReadable);
+const shellCommandsPassed = shellCases.every(item => item.observation.facts.passed);
+const completionReasons = [];
+if (!receiptsValid) completionReasons.push('receipt_invalid');
+if (receiptsValid && !rootPidVisible) completionReasons.push('root_pid_not_visible');
+if (!rootHolderAliveAfter) completionReasons.push('root_holder_ended');
+if (receiptsValid && !runnerControlReadable) completionReasons.push('runner_control_unreadable');
+if (!inheritedCanariesPresent) completionReasons.push('inherited_canaries_missing');
+if (!scrubbedCanariesAbsent) completionReasons.push('scrubbed_canaries_visible');
+if (!shellCommandsPassed) completionReasons.push('sandbox_command_incomplete');
+const controlsComplete = receiptsValid && rootPidVisible && rootHolderAliveAfter && runnerControlReadable &&
+  inheritedCanariesPresent && scrubbedCanariesAbsent && shellCommandsPassed;
+process.stdout.write(`WIF_SHELL_ISOLATION_COMPLETION ${JSON.stringify({
+  structurallyValid: receiptsValid,
+  controlsComplete,
+  inheritedCanariesPresent,
+  scrubbedCanariesAbsent,
+  rootPidVisible,
+  rootHolderAliveAfter,
+  runnerControlReadable,
+  inheritedCommandStatus: inheritedCase.observation.result.status,
+  scrubbedCommandStatus: scrubbedCase.observation.result.status,
+  reasons: completionReasons,
+})}\n`);
+if (!controlsComplete) {
+  process.stderr.write('Sandboxed shell comparison incomplete; observations fail closed.\n');
+  const failedStatus = shellCases.find(item => item.observation.result.status != null && item.observation.result.status !== 0)?.observation.result.status;
+  process.exit(failedStatus ?? 1);
 }
 
 writeFileSync(outputFile, 'Synthetic Linux isolation probe completed.\n', { mode: 0o600 });

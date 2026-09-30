@@ -7,6 +7,11 @@ root_file=$3
 control_file=$4
 label=$5
 
+case "$label" in
+  direct-shell-control|shell-sandbox-command|shell-sandbox-inherited|shell-sandbox-scrubbed) ;;
+  *) exit 2 ;;
+esac
+
 proc_has() {
   pid=$1
   expected=$2
