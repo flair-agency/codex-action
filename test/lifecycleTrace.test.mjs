@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -287,11 +287,15 @@ test("stderr write failures do not change lifecycle completion or file trace", (
       "-e",
       `import { LifecycleTrace } from ${JSON.stringify(sourceUrl)};
 process.stderr.write = () => { throw new Error("closed log"); };
+const initialErrorListeners = process.stderr.listenerCount("error");
 const trace = new LifecycleTrace();
 trace.record("run_started");
 process.stderr.write = (_line, callback) => { callback?.(new Error("EPIPE")); return false; };
 trace.record("action_returned");
-console.log("continued");`,
+setImmediate(() => {
+  if (process.stderr.listenerCount("error") !== initialErrorListeners) process.exitCode = 1;
+  console.log("continued");
+});`,
     ],
     {
       encoding: "utf8",
@@ -304,6 +308,67 @@ console.log("continued");`,
   const traceFiles = readdirSync(runnerTemp);
   assert.equal(traceFiles.length, 1);
   const trace = readFileSync(path.join(runnerTemp, traceFiles[0]), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(trace.map((item) => item.phase), ["run_started", "action_returned"]);
+  rmSync(runnerTemp, { recursive: true, force: true });
+});
+
+test("a real closed stderr pipe cannot terminate lifecycle completion", { timeout: 5_000 }, async () => {
+  const runnerTemp = mkdtempSync(path.join(tmpdir(), "codex-action-trace-epipe-"));
+  const sourceUrl = new URL("../src/lifecycleTrace.ts", import.meta.url).href;
+  const child = spawn(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--disable-warning=ExperimentalWarning",
+      "--input-type=module",
+      "-e",
+      `import { LifecycleTrace } from ${JSON.stringify(sourceUrl)};
+const trace = new LifecycleTrace();
+process.stdout.write("ready\\n");
+process.stdin.once("data", () => {
+  trace.record("run_started");
+  setTimeout(() => {
+    trace.record("action_returned");
+    process.stdout.write("continued\\n");
+  }, 10);
+});`,
+    ],
+    {
+      env: { ...process.env, RUNNER_TEMP: runnerTemp },
+      stdio: ["pipe", "pipe", "pipe"],
+    }
+  );
+
+  let stdout = "";
+  let released = false;
+  const result = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("Timed out waiting for lifecycle subprocess"));
+    }, 4_500);
+    child.once("error", reject);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+      if (!released && stdout.includes("ready\n")) {
+        released = true;
+        child.stderr.destroy();
+        child.stdin.end("start");
+      }
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timeout);
+      resolve({ code, signal });
+    });
+  });
+
+  assert.deepEqual(result, { code: 0, signal: null });
+  assert.match(stdout, /continued\n/);
+  const traceName = readdirSync(runnerTemp).find((name) => name.endsWith(".jsonl"));
+  assert.ok(traceName);
+  const trace = readFileSync(path.join(runnerTemp, traceName), "utf8")
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line));

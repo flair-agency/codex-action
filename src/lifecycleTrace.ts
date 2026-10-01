@@ -53,8 +53,20 @@ const ALLOWED_SIGNALS = new Set([
 export class LifecycleTrace {
   private readonly startedAt = performance.now();
   private readonly descriptor: number | null;
+  private readonly ignoreStderrError = (): void => {};
+  private stderrErrorListenerAttached = false;
+  private stderrWriteCount = 0;
+  private actionReturned = false;
+  private removalScheduled = false;
 
   constructor() {
+    try {
+      process.stderr.on("error", this.ignoreStderrError);
+      this.stderrErrorListenerAttached = true;
+    } catch {
+      // A workflow-log sink is optional diagnostics, never an action dependency.
+    }
+
     const runnerTemp = process.env.RUNNER_TEMP;
     if (runnerTemp == null) {
       this.descriptor = null;
@@ -102,6 +114,7 @@ export class LifecycleTrace {
             : "other";
     }
 
+    if (phase === "action_returned") this.actionReturned = true;
     const line = `${JSON.stringify(record)}\n`;
     try {
       if (this.descriptor != null) {
@@ -111,12 +124,44 @@ export class LifecycleTrace {
       // Lifecycle diagnostics must never change the action result.
     }
 
+    this.stderrWriteCount += 1;
+    let completed = false;
+    const onWriteComplete = () => {
+      if (completed) return;
+      completed = true;
+      this.stderrWriteCount -= 1;
+      this.removeStderrErrorListenerWhenFinished();
+    };
     try {
-      process.stderr.write(line, () => {
-        // A closed or unavailable workflow log is diagnostic-only.
-      });
+      process.stderr.write(line, onWriteComplete);
     } catch {
       // Lifecycle diagnostics must never change the action result.
+      onWriteComplete();
     }
+  }
+
+  private removeStderrErrorListenerWhenFinished(): void {
+    if (
+      !this.actionReturned ||
+      this.stderrWriteCount !== 0 ||
+      !this.stderrErrorListenerAttached ||
+      this.removalScheduled
+    ) {
+      return;
+    }
+
+    this.removalScheduled = true;
+    setImmediate(() => {
+      this.removalScheduled = false;
+      if (!this.actionReturned || this.stderrWriteCount !== 0 || !this.stderrErrorListenerAttached) {
+        return;
+      }
+      try {
+        process.stderr.off("error", this.ignoreStderrError);
+      } catch {
+        // Listener cleanup is diagnostic-only as well.
+      }
+      this.stderrErrorListenerAttached = false;
+    });
   }
 }
