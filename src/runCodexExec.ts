@@ -6,6 +6,7 @@ import type { Readable } from "stream";
 import { setOutput } from "@actions/core";
 import { checkOutput } from "./checkOutput";
 import { captureLinuxRunnerCredentials } from "./linuxCredentials";
+import { LifecycleTrace } from "./lifecycleTrace";
 
 const LINUX_DROP_SUDO_SCRIPT = String.raw`
 node="$1"
@@ -121,21 +122,7 @@ export type OutputSchemaSource =
  * command. Keeping that setup separate also lets tests put a fake `codex` executable on `PATH` to
  * verify command construction and output handling without an API key or network request.
  */
-export async function runCodexExec({
-  prompt,
-  codexHome,
-  cd,
-  extraArgs,
-  explicitOutputFile,
-  outputSchema,
-  model,
-  effort,
-  safetyStrategy,
-  codexUser,
-  sandbox,
-  permissionProfile,
-  timeoutSeconds,
-}: {
+type RunCodexExecOptions = {
   prompt: PromptSource;
   codexHome: string | null;
   cd: string;
@@ -149,7 +136,33 @@ export async function runCodexExec({
   sandbox: SandboxMode | null;
   permissionProfile: string | null;
   timeoutSeconds: number;
-}): Promise<void> {
+};
+
+export async function runCodexExec(options: RunCodexExecOptions): Promise<void> {
+  const trace = new LifecycleTrace();
+  trace.record("run_started");
+  try {
+    await runCodexExecWithTrace(options, trace);
+  } finally {
+    trace.record("action_returned");
+  }
+}
+
+async function runCodexExecWithTrace({
+  prompt,
+  codexHome,
+  cd,
+  extraArgs,
+  explicitOutputFile,
+  outputSchema,
+  model,
+  effort,
+  safetyStrategy,
+  codexUser,
+  sandbox,
+  permissionProfile,
+  timeoutSeconds,
+}: RunCodexExecOptions, trace: LifecycleTrace): Promise<void> {
   let input: string;
   switch (prompt.type) {
     case "inline":
@@ -306,6 +319,7 @@ export async function runCodexExec({
 
   // Split the `program` from the `args` for `spawn()`.
   const program = command.shift()!;
+  trace.record("pre_spawn_ready");
   console.log(
     `Running: ${extraEnv}${program} ${command
       .map((a) => JSON.stringify(a))
@@ -319,11 +333,20 @@ export async function runCodexExec({
   let telemetrySummary: TelemetrySummary | null = null;
   try {
     await new Promise((resolve, reject) => {
-      const child = spawn(program, command, {
-        env,
-        stdio: ["pipe", "pipe", "pipe"],
-        detached: process.platform !== "win32",
-      });
+      trace.record("spawn_requested");
+      const child = (() => {
+        try {
+          return spawn(program, command, {
+            env,
+            stdio: ["pipe", "pipe", "pipe"],
+            detached: process.platform !== "win32",
+          });
+        } catch (error) {
+          trace.record("spawn_error");
+          throw error;
+        }
+      })();
+      child.once("spawn", () => trace.record("spawned"));
       if (telemetry == null) {
         child.stdout.pipe(process.stdout, { end: false });
       } else {
@@ -335,13 +358,23 @@ export async function runCodexExec({
           }
         });
       }
-      child.stderr.pipe(process.stderr, { end: false });
+      const discardChildStderr = () => {
+        child.stderr.unpipe(process.stderr);
+        child.stderr.resume();
+      };
+      process.stderr.on("error", discardChildStderr);
+      if (process.stderr.destroyed) {
+        discardChildStderr();
+      } else {
+        child.stderr.pipe(process.stderr, { end: false });
+      }
       child.stdin.write(input);
       child.stdin.end();
 
       const closeOutputStreams = () => {
         child.stdout.unpipe(process.stdout);
         child.stderr.unpipe(process.stderr);
+        process.stderr.off("error", discardChildStderr);
         child.stdout.destroy();
         child.stderr.destroy();
       };
@@ -352,6 +385,7 @@ export async function runCodexExec({
       const terminate = (reason: string) => {
         if (terminationReason != null) return;
         terminationReason = reason;
+        trace.record("term_attempted");
         try {
           if (process.platform === "win32") {
             if (child.pid != null) {
@@ -373,6 +407,7 @@ export async function runCodexExec({
         killTimer = setTimeout(() => {
           try {
             if (process.platform !== "win32" && child.pid != null) {
+              trace.record("kill_attempted");
               process.kill(-child.pid, "SIGKILL");
             }
           } catch {
@@ -387,10 +422,14 @@ export async function runCodexExec({
       const timeoutHandle =
         timeoutSeconds > 0
           ? setTimeout(
-              () => terminate(`timeout after ${timeoutSeconds} seconds`),
+              () => {
+                trace.record("deadline_fired");
+                terminate(`timeout after ${timeoutSeconds} seconds`);
+              },
               timeoutSeconds * 1000
             )
           : undefined;
+      if (timeoutHandle != null) trace.record("deadline_armed");
 
       const cleanupLifecycle = () => {
         clearTimeout(timeoutHandle);
@@ -400,15 +439,17 @@ export async function runCodexExec({
       };
 
       child.once("error", (err) => {
+        trace.record("child_error");
         cleanupLifecycle();
         settled = true;
         closeOutputStreams();
         reject(err);
       });
 
-      child.once("exit", async (code) => {
+      child.once("exit", async (code, signal) => {
         if (settled) return;
         settled = true;
+        trace.record("child_exit", { exitCode: code, signal });
         clearTimeout(timeoutHandle);
         if (terminationReason != null) {
           // Keep the process group bounded even when the direct child exits on TERM
@@ -416,6 +457,7 @@ export async function runCodexExec({
           await new Promise((resolve) => setTimeout(resolve, TERMINATION_GRACE_MS));
           try {
             if (process.platform !== "win32" && child.pid != null) {
+              trace.record("kill_attempted");
               process.kill(-child.pid, "SIGKILL");
             }
           } catch {
@@ -424,6 +466,7 @@ export async function runCodexExec({
         }
         cleanupLifecycle();
         await drainOutputStreams([child.stdout, child.stderr]);
+        trace.record("drain_finished");
         closeOutputStreams();
         if (terminationReason != null) {
           reject(new Error(`Codex execution cancelled: ${terminationReason}`));

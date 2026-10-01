@@ -17,6 +17,24 @@ There is a lot of valuable context that can be used to fuel your invocation of C
 - **Repository instruction files**: when Codex operates on pull request-controlled content, files such as `AGENTS.md`, `AGENTS.override.md`, or configured fallback project docs from that content should be considered part of the untrusted input surface.
 - **Screenshots**: screenshots and other media have been known to be used as vehicles for prompt injection.
 
+## Treat lifecycle traces as untrusted diagnostics
+
+`run-codex-exec` may write `codex-action-lifecycle-*.jsonl` under `RUNNER_TEMP`. Records contain
+fixed lifecycle phases, monotonic elapsed milliseconds, and, on child exit, a numeric-or-null exit
+code and an allowlisted-or-null signal. The trace is best-effort: an absent or partial file leaves
+unobserved phases unknown and does not establish why execution stopped, whether a review completed,
+or whether acceptance or host enforcement was achieved.
+
+The same fixed records are also emitted to action stderr as best-effort workflow-log diagnostics.
+The Codex child and other log writers can spoof or interleave stderr lines; missing, partial, or
+spoofed log records do not establish lifecycle completion or acceptance. Log write failures are
+ignored and must not change the Action result.
+
+The Codex child shares the job filesystem and can modify or delete the trace; it grants no review,
+acceptance, or host authority. Any future collector must open one validated file without following
+symlinks, validate the fixed record schema, and emit only sanitized records. Never upload raw files
+found by a glob.
+
 ## Limit command permissions
 
 Use `permission-profile` to select the narrowest filesystem and network policy that still lets Codex
