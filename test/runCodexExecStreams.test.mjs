@@ -113,7 +113,24 @@ test("drains buffered stdout and stderr after the direct child exits", async () 
     });
 
     assert.equal(Buffer.concat(stdout.chunks).toString(), stdoutPayload);
-    assert.equal(Buffer.concat(stderr.chunks).toString(), stderrPayload);
+    const lifecycleRecords = [];
+    const childStderrChunks = [];
+    for (const chunk of stderr.chunks) {
+      const text = chunk.toString();
+      try {
+        const record = JSON.parse(text);
+        if (record != null && typeof record === "object" && "phase" in record) {
+          lifecycleRecords.push(record);
+          continue;
+        }
+      } catch {
+        // Child stderr is an opaque stream and may not contain JSON.
+      }
+      childStderrChunks.push(chunk);
+    }
+    assert.equal(Buffer.concat(childStderrChunks).toString(), stderrPayload);
+    assert.ok(lifecycleRecords.some((record) => record.phase === "run_started"));
+    assert.ok(lifecycleRecords.some((record) => record.phase === "action_returned"));
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }

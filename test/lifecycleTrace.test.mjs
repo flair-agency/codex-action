@@ -193,10 +193,28 @@ function assertSafeTrace(trace, traceText) {
   }
 }
 
+function readLiveTrace(stderr) {
+  return stderr
+    .split("\n")
+    .flatMap((line) => {
+      try {
+        const value = JSON.parse(line);
+        return value != null && typeof value === "object" && "phase" in value
+          ? [value]
+          : [];
+      } catch {
+        return [];
+      }
+    });
+}
+
 test("built action records a safe trace for a synthetic quick exit", () => {
   const { result, trace, traceText } = runFakeCodex("quick", 5);
   assert.equal(result.status, 0, result.stderr);
   assertSafeTrace(trace, traceText);
+  const liveTrace = readLiveTrace(result.stderr);
+  assert.deepEqual(liveTrace, trace);
+  assertSafeTrace(liveTrace, liveTrace.map((item) => JSON.stringify(item)).join("\n"));
   const phases = trace.map((item) => item.phase);
   assert.ok(phases.indexOf("spawn_requested") < phases.indexOf("spawned"));
   assert.ok(phases.includes("deadline_armed"));
@@ -211,6 +229,9 @@ test("built action records its deadline and TERM path for a cooperative syntheti
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Codex execution cancelled: timeout after 1 seconds/);
   assertSafeTrace(trace, traceText);
+  const liveTrace = readLiveTrace(result.stderr);
+  assert.deepEqual(liveTrace, trace);
+  assertSafeTrace(liveTrace, liveTrace.map((item) => JSON.stringify(item)).join("\n"));
   const phases = trace.map((item) => item.phase);
   assert.ok(phases.indexOf("deadline_armed") < phases.indexOf("deadline_fired"));
   assert.ok(phases.indexOf("deadline_fired") < phases.indexOf("term_attempted"));
@@ -224,6 +245,9 @@ test("built action records KILL and signal outcome for a synthetic TERM-ignoring
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Codex execution cancelled: timeout after 1 seconds/);
   assertSafeTrace(trace, traceText);
+  const liveTrace = readLiveTrace(result.stderr);
+  assert.deepEqual(liveTrace, trace);
+  assertSafeTrace(liveTrace, liveTrace.map((item) => JSON.stringify(item)).join("\n"));
   const phases = trace.map((item) => item.phase);
   assert.ok(phases.indexOf("deadline_fired") < phases.indexOf("term_attempted"));
   assert.ok(phases.indexOf("term_attempted") < phases.indexOf("kill_attempted"));
@@ -249,4 +273,40 @@ test("built action keeps trace writes on the opened file after child replaces it
     contents: "target-must-remain-unchanged",
   });
   rmSync(tempDir, { recursive: true, force: true });
+});
+
+test("stderr write failures do not change lifecycle completion or file trace", () => {
+  const runnerTemp = mkdtempSync(path.join(tmpdir(), "codex-action-trace-stderr-"));
+  const sourceUrl = new URL("../src/lifecycleTrace.ts", import.meta.url).href;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--disable-warning=ExperimentalWarning",
+      "--input-type=module",
+      "-e",
+      `import { LifecycleTrace } from ${JSON.stringify(sourceUrl)};
+process.stderr.write = () => { throw new Error("closed log"); };
+const trace = new LifecycleTrace();
+trace.record("run_started");
+process.stderr.write = (_line, callback) => { callback?.(new Error("EPIPE")); return false; };
+trace.record("action_returned");
+console.log("continued");`,
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, RUNNER_TEMP: runnerTemp },
+      timeout: 5_000,
+    }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "continued");
+  const traceFiles = readdirSync(runnerTemp);
+  assert.equal(traceFiles.length, 1);
+  const trace = readFileSync(path.join(runnerTemp, traceFiles[0]), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(trace.map((item) => item.phase), ["run_started", "action_returned"]);
+  rmSync(runnerTemp, { recursive: true, force: true });
 });

@@ -25,6 +25,11 @@ code and an allowlisted-or-null signal. The trace is best-effort: an absent or p
 unobserved phases unknown and does not establish why execution stopped, whether a review completed,
 or whether acceptance or host enforcement was achieved.
 
+The same fixed records are also emitted to action stderr as best-effort workflow-log diagnostics.
+The Codex child and other log writers can spoof or interleave stderr lines; missing, partial, or
+spoofed log records do not establish lifecycle completion or acceptance. Log write failures are
+ignored and must not change the Action result.
+
 The Codex child shares the job filesystem and can modify or delete the trace; it grants no review,
 acceptance, or host authority. Any future collector must open one validated file without following
 symlinks, validate the fixed record schema, and emit only sanitized records. Never upload raw files

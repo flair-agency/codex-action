@@ -83,8 +83,6 @@ export class LifecycleTrace {
     phase: LifecyclePhase,
     outcome?: { exitCode: number | null; signal: NodeJS.Signals | null }
   ): void {
-    if (this.descriptor == null) return;
-
     const record: {
       phase: LifecyclePhase;
       elapsedMs: number;
@@ -104,9 +102,19 @@ export class LifecycleTrace {
             : "other";
     }
 
+    const line = `${JSON.stringify(record)}\n`;
     try {
-      const line = `${JSON.stringify(record)}\n`;
-      writeSync(this.descriptor, line, undefined, "utf8");
+      if (this.descriptor != null) {
+        writeSync(this.descriptor, line, undefined, "utf8");
+      }
+    } catch {
+      // Lifecycle diagnostics must never change the action result.
+    }
+
+    try {
+      process.stderr.write(line, () => {
+        // A closed or unavailable workflow log is diagnostic-only.
+      });
     } catch {
       // Lifecycle diagnostics must never change the action result.
     }
