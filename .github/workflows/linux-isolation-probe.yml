@@ -1,0 +1,196 @@
+name: Linux synthetic WIF isolation probe
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/linux-isolation-probe.yml'
+      - 'probe/linux-isolation/probe.mjs'
+      - 'probe/linux-isolation/observe-shell.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic-canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout candidate source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f
+        with:
+          node-version: 22
+
+      - name: Test synthetic proc-stat parsing
+        run: node "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" test-proc-stat-parser
+
+      - name: Install and identify the pinned public Codex CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global --ignore-scripts @openai/codex@0.159.2
+          codex --version
+          codex sandbox --help
+          real_codex="$(command -v codex)"
+          echo "PROBE_REAL_CODEX=$real_codex" >> "$GITHUB_ENV"
+          echo "PROBE_NODE=$(node -p 'process.execPath')" >> "$GITHUB_ENV"
+
+      - name: Prepare disposable Linux canaries and run action wrapper probe
+        shell: bash
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: 'http://127.0.0.1:9/mock-oidc?audience=synthetic-probe'
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'synthetic-github-oidc-request-token-canary'
+          SYNTHETIC_GITHUB_OIDC_SUBJECT_TOKEN: 'eyJ.synthetic-github-subject-token.signature'
+          OPENAI_API_KEY: 'sk-proj-synthetic-openai-api-key-canary'
+          SYNTHETIC_OPENAI_API_ACCESS_TOKEN: 'eyJ.synthetic-openai-api-token.signature'
+          PROBE_ROOT_FILE: ${{ runner.temp }}/wif-root-owned-canary
+          PROBE_ROOT_PID_FILE: ${{ runner.temp }}/wif-root-process.pid
+          PROBE_ROOT_START_FILE: ${{ runner.temp }}/wif-root-process-starttime
+          PROBE_ROOT_READY_FILE: ${{ runner.temp }}/wif-root-ready.json
+          PROBE_ROOT_REQUEST_FILE: ${{ runner.temp }}/wif-root-post-request
+          PROBE_ROOT_POST_FILE: ${{ runner.temp }}/wif-root-post-receipt.json
+          PROBE_ROOT_ACK_FILE: ${{ runner.temp }}/wif-root-post-ack
+          PROBE_SAME_UID_HOLDER_PID_FILE: ${{ runner.temp }}/wif-same-uid-holder.pid
+          PROBE_SAME_UID_HOLDER_START_FILE: ${{ runner.temp }}/wif-same-uid-holder-starttime
+          PROBE_SAME_UID_HOLDER_FILE: ${{ runner.temp }}/wif-same-uid-holder-canary
+          PROBE_CONTROL_FILE: ${{ runner.temp }}/wif-runner-control
+          PROBE_CODEX_HOME: ${{ runner.temp }}/wif-empty-codex-home
+          PROBE_BIN_DIR: ${{ runner.temp }}/wif-probe-bin
+          PROBE_ROOT_FILE_CANARY: 'synthetic-root-owned-subject-token-file-canary'
+          PROBE_ROOT_PROC_CANARY: 'synthetic-root-process-oidc-token-canary'
+        run: |
+          set -euo pipefail
+
+          # Match the action's hosted-Linux user-namespace preparation before
+          # drop-sudo removes the runner's sudo access.
+          current_userns="$(sudo sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [[ -n "$current_userns" && "$current_userns" != 1 ]]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          current_apparmor="$(sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [[ -n "$current_apparmor" && "$current_apparmor" != 0 ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+          mkdir -p "$PROBE_CODEX_HOME" "$PROBE_BIN_DIR"
+          sudo install -o root -g root -m 600 /dev/null "$PROBE_ROOT_FILE"
+          printf '%s' "$PROBE_ROOT_FILE_CANARY" | sudo tee "$PROBE_ROOT_FILE" >/dev/null
+          : > "$PROBE_ROOT_REQUEST_FILE"
+          chmod 600 "$PROBE_ROOT_REQUEST_FILE"
+          : > "$PROBE_ROOT_ACK_FILE"
+          chmod 600 "$PROBE_ROOT_ACK_FILE"
+          printf '%s' 'synthetic-same-uid-holder-file-canary' > "$PROBE_SAME_UID_HOLDER_FILE"
+          chmod 600 "$PROBE_SAME_UID_HOLDER_FILE"
+          printf '%s' 'synthetic-runner-control-file-canary' > "$PROBE_CONTROL_FILE"
+          chmod 600 "$PROBE_CONTROL_FILE"
+
+          env -i SYNTHETIC_SAME_UID_AUTH_HOLDER='synthetic-same-uid-auth-holder-canary' \
+            /bin/sh -c 'printf "%s" "$$" > "$1"; exec /bin/sleep 300' \
+            sh "$PROBE_SAME_UID_HOLDER_PID_FILE" >/dev/null 2>&1 &
+          for _ in {1..30}; do
+            [[ -s "$PROBE_SAME_UID_HOLDER_PID_FILE" ]] && break
+            sleep 0.1
+          done
+          test -s "$PROBE_SAME_UID_HOLDER_PID_FILE"
+          same_uid_holder_pid="$(cat "$PROBE_SAME_UID_HOLDER_PID_FILE")"
+          "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
+            verify-sameuid "$same_uid_holder_pid" "$PROBE_SAME_UID_HOLDER_FILE" \
+            "$PROBE_SAME_UID_HOLDER_START_FILE" "$PROBE_CONTROL_FILE"
+          same_uid_holder_starttime="$(cat "$PROBE_SAME_UID_HOLDER_START_FILE")"
+          [[ "$same_uid_holder_starttime" =~ ^[0-9]+$ ]]
+          export PROBE_SAME_UID_HOLDER_PID="$same_uid_holder_pid"
+          export PROBE_SAME_UID_HOLDER_STARTTIME="$same_uid_holder_starttime"
+          export PROBE_SAME_UID_EXPECTED_UID="$(id -u)"
+          export PROBE_SAME_UID_PREFLIGHT_VALID=true
+
+          sudo env -u NODE_OPTIONS \
+            PROBE_ROOT_PROC_CANARY="$PROBE_ROOT_PROC_CANARY" \
+            "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" root-holder \
+            "$PROBE_ROOT_FILE" "$PROBE_ROOT_READY_FILE" "$PROBE_ROOT_REQUEST_FILE" \
+            "$PROBE_ROOT_POST_FILE" "$PROBE_ROOT_ACK_FILE" "$PROBE_ROOT_PID_FILE" "$PROBE_ROOT_START_FILE" \
+            >/dev/null 2>&1 &
+          for _ in {1..30}; do
+            [[ -s "$PROBE_ROOT_READY_FILE" ]] && break
+            sleep 0.1
+          done
+          test -s "$PROBE_ROOT_READY_FILE"
+          "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
+            verify-root-ready "$PROBE_ROOT_READY_FILE"
+          root_pid="$(sudo cat "$PROBE_ROOT_PID_FILE")"
+          export PROBE_ROOT_PID="$root_pid"
+          root_start_time="$(sudo cat "$PROBE_ROOT_START_FILE")"
+          [[ "$root_start_time" =~ ^[0-9]+$ ]]
+          export PROBE_ROOT_STARTTIME="$root_start_time"
+
+          cleanup_probe_holders() {
+            if [[ -n "${root_pid:-}" && "${drop_sudo_started:-false}" != true ]]; then sudo kill "$root_pid" >/dev/null 2>&1 || true; fi
+            if [[ -n "${same_uid_holder_pid:-}" ]]; then kill "$same_uid_holder_pid" >/dev/null 2>&1 || true; fi
+          }
+          trap cleanup_probe_holders EXIT
+
+          # Validate the shell fixture directly before running it under Codex's sandbox.
+          # Its receipt contains only synthetic canary visibility booleans.
+          /bin/sh "$GITHUB_WORKSPACE/probe/linux-isolation/observe-shell.sh" \
+            "$$" "$root_pid" "$PROBE_ROOT_FILE" "$PROBE_CONTROL_FILE" direct-shell-control \
+            "$same_uid_holder_pid" "$PROBE_SAME_UID_HOLDER_FILE" "$PROBE_SAME_UID_EXPECTED_UID"
+
+          cat > "$PROBE_BIN_DIR/codex" <<'SHIM'
+          #!/usr/bin/env bash
+          exec "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" shim "$@"
+          SHIM
+          chmod 700 "$PROBE_BIN_DIR/codex"
+          export PATH="$PROBE_BIN_DIR:$PATH"
+          export PROBE_WRAPPER_PARENT_PID="$$"
+          # This final step removes sudo only on the disposable hosted runner.
+          # Findings are visibility observations, not an acceptance decision.
+
+          drop_sudo_started=true
+          if node "$GITHUB_WORKSPACE/dist/main.js" run-codex-exec \
+            --prompt 'synthetic local sandbox probe; do not call a model' \
+            --prompt-file '' \
+            --codex-home "$PROBE_CODEX_HOME" \
+            --cd "$GITHUB_WORKSPACE" \
+            --extra-args '[]' \
+            --output-file "$RUNNER_TEMP/wif-probe-output.md" \
+            --output-schema-file '' \
+            --output-schema '' \
+            --sandbox 'read-only' \
+            --permission-profile '' \
+            --model '' \
+            --effort '' \
+            --safety-strategy 'drop-sudo' \
+            --codex-user '' \
+            --timeout-seconds 45; then
+            action_status=0
+          else
+            action_status=$?
+          fi
+
+          printf '%s' 'synthetic-root-postcheck-request-v1' > "$PROBE_ROOT_REQUEST_FILE"
+          for _ in {1..100}; do
+            [[ -s "$PROBE_ROOT_POST_FILE" ]] && break
+            sleep 0.1
+          done
+          if [[ -s "$PROBE_ROOT_POST_FILE" ]]; then
+            if "$PROBE_NODE" "$GITHUB_WORKSPACE/probe/linux-isolation/probe.mjs" \
+              verify-root-post "$root_pid" "$root_start_time" "$PROBE_ROOT_FILE" \
+              "$PROBE_ROOT_POST_FILE" "$PROBE_ROOT_ACK_FILE"; then
+              root_post_status=0
+            else
+              root_post_status=$?
+            fi
+          else
+            echo 'Root holder post-check receipt was not produced.' >&2
+            root_post_status=1
+          fi
+
+          if [[ "$action_status" -ne 0 ]]; then exit "$action_status"; fi
+          if [[ "$root_post_status" -ne 0 ]]; then exit 1; fi
+
+          test "$(cat "$RUNNER_TEMP/wif-probe-output.md")" = "Synthetic Linux isolation probe completed."
