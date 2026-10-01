@@ -135,3 +135,76 @@ test("drains buffered stdout and stderr after the direct child exits", async () 
     rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test("discards child stderr after the workflow log sink fails and still drains the child", {
+  timeout: 5_000,
+}, async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "codex-action-stderr-epipe-"));
+  const outputPath = path.join(tempDir, "output.txt");
+  writeFileSync(outputPath, "fake final message\n", "utf8");
+
+  let sinkFailed = false;
+  const stderr = new Writable({
+    highWaterMark: 1024,
+    write(_chunk, _encoding, callback) {
+      if (!sinkFailed) {
+        sinkFailed = true;
+        setImmediate(() => callback(new Error("EPIPE")));
+        return;
+      }
+      callback();
+    },
+  });
+  let sinkErrorEvents = 0;
+  stderr.on("error", () => { sinkErrorEvents += 1; });
+
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough({ highWaterMark: 1024 });
+  const totalChunks = 128;
+  let writtenChunks = 0;
+  child.stderr.once("end", () => setImmediate(() => child.emit("exit", 0)));
+
+  const runCodexExec = loadRunCodexExec(
+    () => {
+      const produce = () => {
+        while (writtenChunks < totalChunks) {
+          writtenChunks += 1;
+          if (!child.stderr.write(Buffer.alloc(64 * 1024))) {
+            child.stderr.once("drain", produce);
+            return;
+          }
+        }
+        child.stderr.end();
+      };
+      setTimeout(produce, 20);
+      return child;
+    },
+    captureOutput().stream,
+    stderr
+  );
+
+  try {
+    await runCodexExec({
+      prompt: { type: "inline", content: "test" },
+      codexHome: null,
+      cd: tempDir,
+      extraArgs: [],
+      explicitOutputFile: outputPath,
+      outputSchema: null,
+      model: null,
+      effort: null,
+      safetyStrategy: "unsafe",
+      codexUser: null,
+      sandbox: null,
+      permissionProfile: null,
+    });
+    assert.equal(sinkFailed, true);
+    assert.ok(sinkErrorEvents > 0);
+    assert.equal(writtenChunks, totalChunks);
+    assert.equal(child.stderr.readableLength, 0);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});

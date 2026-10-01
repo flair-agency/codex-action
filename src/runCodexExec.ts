@@ -358,13 +358,23 @@ async function runCodexExecWithTrace({
           }
         });
       }
-      child.stderr.pipe(process.stderr, { end: false });
+      const discardChildStderr = () => {
+        child.stderr.unpipe(process.stderr);
+        child.stderr.resume();
+      };
+      process.stderr.on("error", discardChildStderr);
+      if (process.stderr.destroyed) {
+        discardChildStderr();
+      } else {
+        child.stderr.pipe(process.stderr, { end: false });
+      }
       child.stdin.write(input);
       child.stdin.end();
 
       const closeOutputStreams = () => {
         child.stdout.unpipe(process.stdout);
         child.stderr.unpipe(process.stderr);
+        process.stderr.off("error", discardChildStderr);
         child.stdout.destroy();
         child.stderr.destroy();
       };

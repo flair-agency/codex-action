@@ -375,3 +375,123 @@ process.stdin.once("data", () => {
   assert.deepEqual(trace.map((item) => item.phase), ["run_started", "action_returned"]);
   rmSync(runnerTemp, { recursive: true, force: true });
 });
+
+test("drains high-volume Codex stderr after the workflow log pipe closes", {
+  timeout: 10_000,
+}, async () => {
+  const tempDir = mkdtempSync(path.join(tmpdir(), "codex-action-trace-child-epipe-"));
+  const runnerTemp = path.join(tempDir, "runner-temp");
+  mkdirSync(runnerTemp);
+  const fakeCodexPath = path.join(tempDir, "fake-codex.mjs");
+  const launcherPath = path.join(tempDir, "codex");
+  const outputPath = path.join(tempDir, "output.txt");
+  const triggerPath = path.join(tempDir, "write-stderr-now");
+  writeFileSync(
+    fakeCodexPath,
+    `import { existsSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf("--output-last-message");
+writeFileSync(args[outputIndex + 1], "synthetic final message\\n");
+process.stdout.write("codex-ready\\n");
+const watch = setInterval(() => {
+  if (!existsSync(process.env.TRACE_TRIGGER)) return;
+  clearInterval(watch);
+  const chunk = Buffer.alloc(64 * 1024, "x");
+  let written = 0;
+  const produce = () => {
+    while (written < 128) {
+      written += 1;
+      if (!process.stderr.write(chunk)) {
+        process.stderr.once("drain", produce);
+        return;
+      }
+    }
+    process.stdout.write("codex-complete\\n");
+    process.exit(0);
+  };
+  produce();
+}, 5);
+`,
+    "utf8"
+  );
+  writeFileSync(
+    launcherPath,
+    `#!/bin/sh\nexec "${process.execPath}" "${fakeCodexPath}" "$@"\n`,
+    "utf8"
+  );
+  chmodSync(launcherPath, 0o755);
+
+  const action = spawn(
+    process.execPath,
+    [
+      mainPath,
+      "run-codex-exec",
+      "--prompt",
+      "trace secret prompt",
+      "--prompt-file",
+      "",
+      "--codex-home",
+      "",
+      "--cd",
+      tempDir,
+      "--extra-args",
+      "",
+      "--output-file",
+      outputPath,
+      "--output-schema-file",
+      "",
+      "--output-schema",
+      "",
+      "--sandbox",
+      "",
+      "--model",
+      "trace-secret-model",
+      "--effort",
+      "",
+      "--safety-strategy",
+      "unsafe",
+      "--codex-user",
+      "",
+      "--timeout-seconds",
+      "4",
+    ],
+    {
+      env: {
+        ...process.env,
+        GITHUB_OUTPUT: undefined,
+        PATH: `${tempDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        RUNNER_TEMP: runnerTemp,
+        TRACE_TRIGGER: triggerPath,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    }
+  );
+
+  let stdout = "";
+  let sinkClosed = false;
+  const result = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      action.kill("SIGKILL");
+      reject(new Error("Timed out waiting for the high-volume Codex child"));
+    }, 9_000);
+    action.once("error", reject);
+    action.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+      if (!sinkClosed && stdout.includes("codex-ready\n")) {
+        sinkClosed = true;
+        action.stderr.destroy();
+        writeFileSync(triggerPath, "go", "utf8");
+      }
+    });
+    action.once("close", (code, signal) => {
+      clearTimeout(timeout);
+      resolve({ code, signal });
+    });
+  });
+
+  assert.equal(sinkClosed, true);
+  assert.deepEqual(result, { code: 0, signal: null });
+  assert.match(stdout, /codex-complete\n/);
+  assert.equal(readFileSync(outputPath, "utf8"), "synthetic final message\n");
+  rmSync(tempDir, { recursive: true, force: true });
+});
